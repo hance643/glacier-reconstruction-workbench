@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+outputs/
+logs/
+.local/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+ui_check.png
+ui_preview.png
+ui_business_baseline.json
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local visual review artifacts
+background_raw.png
+background_blur.png
+ui_visual_review.png

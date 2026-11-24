@@ -1,0 +1,1172 @@
+"""Qt 主界面。后台线程只传递数据，所有控件更新都在主线程执行。"""
+from dataclasses import asdict, replace
+import json
+from pathlib import Path
+
+import math
+import random
+from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRectF, QObject, QEvent
+from PySide6.QtGui import (QBrush, QColor, QImage, QLinearGradient, QPainter, QPainterPath,
+                            QPen, QRadialGradient, QPixmap)
+from PySide6.QtWidgets import (
+    QApplication, QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QInputDialog,
+    QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+
+from .evaluation import APIConfig, evaluate, validate_api
+from .pipeline import PipelineConfig
+from .discovery import KEYS, discover, is_tool_path
+from .preprocessing import PreprocessConfig, collect_images, preprocess, read_rgb, resize_long_edge
+from .tasks import reconstruction_task, save_json
+from .viewer import ModelViewer
+from .workers import Worker
+
+
+class CapsuleStyle(QObject):
+    """Qt does not clamp oversized QSS radii like CSS; fit the pill to its bounds.
+
+    This filter only adjusts painting style. Button signals and actions are untouched.
+    """
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            radius = max(1, min(100, watched.height() // 2, watched.width() // 2))
+            style = f'border-radius:{radius}px;'
+            if watched.styleSheet() != style:
+                watched.setStyleSheet(style)
+        return super().eventFilter(watched, event)
+
+
+class DropList(QListWidget):
+    """专用拖放区，也允许文件夹；文件列表的扫描在后台执行。"""
+    files_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setAlternatingRowColors(True)
+        self.setMinimumHeight(140)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self.files_dropped.emit([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
+        event.acceptProposedAction()
+
+    def paths(self):
+        return [Path(self.item(i).text()) for i in range(self.count())]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        paint_frost(self, painter, QRectF(self.rect()))
+        painter.end()
+        super().paintEvent(event)
+
+
+class AtmosphereWidget(QWidget):
+    """Procedural animated dark atmosphere; no background image or network asset."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.phase = 0.0
+        self._frame = QImage()
+        self._frost = QImage()
+        self._frame_size = None
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # One-megapixel sparse film-grain layer, generated once and stretched to the window.
+        noise = QImage(1000, 1000, QImage.Format.Format_RGBA8888)
+        noise.fill(QColor(255, 255, 255, 0))
+        rng = random.Random(2048)
+        for _ in range(5000):  # 0.005 density, as requested
+            x, y = rng.randrange(1000), rng.randrange(1000)
+            shade = rng.choice((196, 206, 222, 235))
+            noise.setPixelColor(x, y, QColor(shade, shade, shade, 10))
+        self.grain = noise
+        self.clock = QTimer(self)
+        self.clock.setInterval(100)
+        self.clock.timeout.connect(self.advance)
+        self.clock.start()
+
+    def advance(self):
+        self.phase = (self.phase + 0.0035) % (2 * math.pi)
+        self._frame_size = None
+        self.update()
+        for surface in self.findChildren(QWidget):
+            if surface.property("frostSurface"):
+                surface.update()
+
+    def ensure_frame(self):
+        """Cache the scene and a 12 logical-pixel Gaussian-blurred backdrop.
+
+        Only the atmosphere is sampled: controls and text are never blurred.
+        Rendering at half resolution bounds the animated painting cost.
+        """
+        size = (max(1, self.width()), max(1, self.height()))
+        if self._frame_size == size:
+            return
+        from PIL import Image, ImageFilter
+        frame = QImage(max(1, size[0] // 2), max(1, size[1] // 2),
+                       QImage.Format.Format_RGBA8888)
+        frame.fill(QColor('#080a12'))
+        painter = QPainter(frame)
+        self.draw_scene(painter, frame.width(), frame.height())
+        painter.end()
+        pixels = Image.frombytes('RGBA', (frame.width(), frame.height()),
+                                 bytes(frame.constBits()), 'raw', 'RGBA', frame.bytesPerLine())
+        blurred = pixels.filter(ImageFilter.GaussianBlur(6))
+        self._frame = frame
+        self._frost = QImage(blurred.tobytes(), frame.width(), frame.height(),
+                             QImage.Format.Format_RGBA8888).copy()
+        self._frame_size = size
+
+    def paintEvent(self, event):
+        self.ensure_frame()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(self.rect(), self._frame)
+
+    def draw_scene(self, painter, width, height):
+        """Procedural scene shared by the clear and frosted layers."""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(0, 0, width, height)
+        painter.fillRect(bounds, QColor('#080a12'))
+        base = QLinearGradient(0, 0, width, height)
+        base.setColorAt(0.0, QColor('#0C1724'))
+        base.setColorAt(0.46, QColor('#0E1C2B'))
+        base.setColorAt(1.0, QColor('#09121D'))
+        painter.fillRect(bounds, base)
+
+        # 多个大而虚的灰蓝色雾团彼此叠加，形成参考截图中的云雾纹理；
+        # 透明度保持克制，不形成亮斑。频率为整数，动画循环无跳变。
+        t = self.phase
+        clouds = [
+            (.08, .14, .19, .25, 48, 0.0),
+            (.29, .26, .21, .18, 42, 1.2),
+            (.52, .12, .18, .23, 48, 2.4),
+            (.79, .22, .22, .26, 50, 3.1),
+            (.99, .48, .18, .27, 44, 4.2),
+            (.66, .61, .23, .21, 45, 5.1),
+            (.32, .78, .22, .2, 43, .7),
+            (.08, .91, .2, .22, 39, 2.8),
+            (.91, .86, .16, .18, 40, 4.8),
+            (.46, .45, .13, .19, 31, 3.7),
+        ]
+        for index, (x, y, rx, ry, alpha, offset) in enumerate(clouds):
+            drift_x = .018 * math.sin(t + offset)
+            drift_y = .022 * math.cos(t + offset)
+            cx = width * (x + drift_x)
+            cy = height * (y + drift_y)
+            painter.save()
+            painter.translate(cx, cy)
+            painter.rotate(-18 + 9 * math.sin(t + offset))
+            painter.scale(width * rx, height * ry)
+            mist = QRadialGradient(QPointF(0, 0), 1.0)
+            mist.setColorAt(0, QColor(105, 132, 158, alpha))
+            mist.setColorAt(.34, QColor(82, 108, 136, int(alpha * .68)))
+            mist.setColorAt(.72, QColor(57, 80, 106, int(alpha * .24)))
+            mist.setColorAt(1, QColor(39, 57, 77, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(mist)
+            painter.drawEllipse(QPointF(0, 0), 1.0, 1.0)
+            painter.restore()
+
+        # 一处很弱的冰川折射微光，保留截图里右上区域的冷色反射感。
+        painter.save()
+        painter.translate(width * (.78 + .012 * math.sin(t)),
+                          height * (.23 + .014 * math.cos(t)))
+        painter.rotate(-24)
+        painter.scale(width * .12, height * .035)
+        shimmer = QRadialGradient(QPointF(0, 0), 1.0)
+        shimmer.setColorAt(0, QColor(157, 188, 216, 8))
+        shimmer.setColorAt(.35, QColor(111, 145, 177, 4))
+        shimmer.setColorAt(1, QColor(95, 121, 144, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(shimmer)
+        painter.drawEllipse(QPointF(0, 0), 1.0, 1.0)
+        painter.restore()
+
+        vignette = QRadialGradient(QPointF(width * .5, height * .48),
+                                   max(width, height) * .78)
+        vignette.setColorAt(0, QColor(0, 0, 0, 0))
+        vignette.setColorAt(.58, QColor(0, 0, 0, 3))
+        vignette.setColorAt(1, QColor(0, 0, 0, 16))
+        painter.fillRect(bounds, vignette)
+        painter.setOpacity(.10)
+        painter.drawImage(bounds, self.grain)
+
+        # Soft ice-face reflections replace the illustrative mountain line.
+        painter.setOpacity(1)
+        for x, y, angle, strength in ((.31, .52, 24, 12), (.59, .67, 32, 16),
+                                       (.85, .46, 18, 11)):
+            painter.save()
+            painter.translate(width*x, height*y)
+            painter.rotate(angle)
+            painter.scale(width*.035, height*.32)
+            reflection = QRadialGradient(QPointF(0, 0), 1)
+            reflection.setColorAt(0, QColor(168, 201, 227, strength))
+            reflection.setColorAt(.4, QColor(106, 151, 186, strength//2))
+            reflection.setColorAt(1, QColor(106, 151, 186, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(reflection)
+            painter.drawEllipse(QPointF(0, 0), 1, 1)
+            painter.restore()
+
+
+def paint_frost(widget, painter, rect):
+    """Backdrop blur + CSS rgba(25,35,50,.22) + fine white rim."""
+    root = widget.window().centralWidget()
+    if not isinstance(root, AtmosphereWidget):
+        return
+    root.ensure_frame()
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(rect, 10, 10)
+    painter.setClipPath(path)
+    position = widget.mapTo(root, QPoint(0, 0))
+    sx = root._frost.width() / max(1, root.width())
+    sy = root._frost.height() / max(1, root.height())
+    source = QRectF((position.x()+rect.x())*sx, (position.y()+rect.y())*sy,
+                    rect.width()*sx, rect.height()*sy)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    painter.drawImage(rect, root._frost, source)
+    painter.fillRect(rect, QColor(25, 35, 50, 46))
+    sheen = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    sheen.setColorAt(0, QColor(208, 231, 249, 13))
+    sheen.setColorAt(.35, QColor(208, 231, 249, 0))
+    sheen.setColorAt(1, QColor(188, 219, 244, 5))
+    painter.fillRect(rect, sheen)
+    painter.setClipping(False)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor(239, 248, 255, 64), 1))
+    painter.drawRoundedRect(rect.adjusted(.5, .5, -.5, -.5), 10, 10)
+    inner = rect.adjusted(1.5, 1.5, -1.5, -1.5)
+    edge = QLinearGradient(inner.topLeft(), inner.bottomLeft())
+    edge.setColorAt(0, QColor(224, 242, 255, 38))
+    edge.setColorAt(.12, QColor(224, 242, 255, 0))
+    edge.setColorAt(.86, QColor(224, 242, 255, 0))
+    edge.setColorAt(1, QColor(174, 211, 239, 23))
+    painter.setPen(QPen(QBrush(edge), 1))
+    painter.drawRoundedRect(inner, 9, 9)
+    painter.restore()
+
+
+class FrostGroupBox(QGroupBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setProperty('frostSurface', True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        paint_frost(self, painter, QRectF(self.rect()).adjusted(0, 12, 0, 0))
+        painter.end()
+        super().paintEvent(event)
+
+
+class FrostLabel(QLabel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setProperty('frostSurface', True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        paint_frost(self, painter, QRectF(self.rect()))
+        painter.end()
+        super().paintEvent(event)
+
+
+class FrostTabs(QTabWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setProperty('frostSurface', True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        paint_frost(self, painter, QRectF(self.rect()).adjusted(0, self.tabBar().height(), 0, 0))
+        painter.end()
+        super().paintEvent(event)
+
+
+class EvaluationPanel(QWidget):
+    """评分不假设满分或量纲，指标和值直接取自 API，并保留原始 JSON。"""
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        self.score = QLabel('尚未评价')
+        self.score.setObjectName('sectionTitle')
+        layout.addWidget(self.score)
+        self.metrics = QTableWidget(0, 2)
+        self.metrics.setHorizontalHeaderLabels(['后端指标', '后端返回值'])
+        self.metrics.horizontalHeader().setStretchLastSection(True)
+        self.metrics.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.metrics)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlaceholderText('API 评价文本')
+        layout.addWidget(self.text)
+        self.raw = QPlainTextEdit()
+        self.raw.setReadOnly(True)
+        self.raw.setPlaceholderText('原始 JSON 响应')
+        layout.addWidget(self.raw)
+
+    def reset(self, message='尚未评价'):
+        self.score.setText(message)
+        self.metrics.setRowCount(0)
+        self.text.clear()
+        self.raw.clear()
+
+    def display(self, payload):
+        result = payload['result']
+        # 没有 score 字段时如实标注，不计算或猜测一个评分。
+        score = result.get('score', '后端未提供 score')
+        self.score.setText('评分：' + str(score))
+        self.score.setTextFormat(Qt.TextFormat.PlainText)
+        metrics = result.get('metrics', {})
+        if not isinstance(metrics, dict):
+            metrics = {'metrics': metrics}
+        self.metrics.setRowCount(len(metrics))
+        for row, (key, value) in enumerate(metrics.items()):
+            self.metrics.setItem(row, 0, QTableWidgetItem(str(key)))
+            self.metrics.setItem(row, 1, QTableWidgetItem(
+                json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)))
+        text = result.get('text', result.get('evaluation', result.get('summary', result.get('message', ''))))
+        self.text.setPlainText(text if isinstance(text, str) else json.dumps(text, ensure_ascii=False, indent=2))
+        self.raw.setPlainText(json.dumps(payload['raw'], ensure_ascii=False, indent=2))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('冰川三维重建 · Glacier Reconstruction Studio')
+        # Start in the same landscape, compact workstation proportion as the
+        # supplied reference while remaining resizable on smaller displays.
+        self.resize(1440, 810)
+        self.setMinimumSize(1180, 700)
+        self.setAcceptDrops(True)
+        self.workers = set()       # 保持强引用，防止运行中的 QThread 被析构
+        self.job = None
+        self.preview_worker = None
+        self.preview_revision = 0
+        self.models = {}
+        self.evaluations = {}
+        self.closing = False
+        self._build()
+        # 窗口先显示，再在工作线程恢复/发现工具，避免遍历安装目录卡住 GUI。
+        QTimer.singleShot(300, self.auto_detect_tools)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(250)   # 调参防抖，避免每次按键都启动计算
+        self.preview_timer.timeout.connect(self.launch_preview)
+        self.detected_tools = {}
+        self.restore_tool_paths()
+        for field in self.tool_path_fields().values():
+            field.editingFinished.connect(self.cache_tool_paths)
+
+    def _build(self):
+        root = AtmosphereWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(22, 16, 22, 12)
+        layout.setSpacing(8)
+        brand = QLabel('GLACIER  /  FIELD RECONSTRUCTION')
+        brand.setObjectName('eyebrow')
+        layout.addWidget(brand)
+        self.title_label = QLabel('冰川三维重建工作台')
+        self.title_label.setObjectName('appTitle')
+        layout.addWidget(self.title_label)
+        subtitle = QLabel('图像导入 → 冰雪影像预处理 → 双路径重建 → 模型对比与 API 评价')
+        subtitle.setObjectName('subtitle')
+        root.setToolTip(subtitle.text())
+        subtitle.hide()
+        header_rule = QWidget()
+        header_rule.setFixedHeight(1)
+        header_rule.setStyleSheet('background: rgba(255,255,255,34);')
+        layout.addWidget(header_rule)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(6)
+        layout.addWidget(splitter, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # Keep the control rail compact and prevent a horizontal scrollbar from
+        # appearing when long filesystem paths are present in the editors.
+        scroll.setMinimumWidth(340)
+        scroll.setMaximumWidth(380)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left = QWidget()
+        side = QVBoxLayout(left)
+        side.setContentsMargins(4, 2, 4, 2)
+        side.setSpacing(6)
+        scroll.setWidget(left)
+        splitter.addWidget(scroll)
+        self._preprocess_panel(side)
+        self._algorithm_panel(side)
+        self._api_panel(side)
+        side.addStretch()
+        self.tabs = FrostTabs()
+        splitter.addWidget(self.tabs)
+        splitter.setSizes([390, 1210])
+        self._input_page()
+        self._results_page()
+        self._logs_page()
+        # Very light cool rim on the outer glass cards. Child widgets stay
+        # transparent so the procedural atmosphere remains visible beneath.
+        self.tabs.setObjectName('glassTabs')
+        scroll.setObjectName('glassRail')
+        for panel in (self.tabs, scroll):
+            panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        footer = QHBoxLayout()
+        self.run_button = QPushButton('开始重建')
+        self.run_button.setObjectName('primaryButton')
+        self.run_button.clicked.connect(self.start)
+        self.cancel_button = QPushButton('取消任务')
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel)
+        self.progress = QProgressBar()
+        self.stage_label = QLabel('就绪')
+        self.stage_label.setMinimumWidth(104)
+        self.stage_label.setObjectName('statusText')
+        footer.addWidget(self.run_button)
+        footer.addWidget(self.cancel_button)
+        footer.addWidget(self.progress, 1)
+        footer.addWidget(self.stage_label)
+        layout.addLayout(footer)
+        self._capsule_style = CapsuleStyle(self)
+        for button in self.findChildren(QPushButton):
+            button.installEventFilter(self._capsule_style)
+        self.statusBar().showMessage('可拖入单张/多张照片或文件夹；重建需要至少两张重叠影像。')
+
+    def _preprocess_panel(self, layout):
+        box = FrostGroupBox('冰雪影像预处理')
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 12, 8, 6)
+        form.setVerticalSpacing(4)
+        form.setHorizontalSpacing(8)
+        self.prep_widgets = {}
+        specs = [
+            ('highlight', '雪面高光压缩', 0, .8, .05, .15, '压缩高亮区域；不能恢复饱和像素。'),
+            ('clahe', '局部对比度 CLAHE', 0, 6, .1, 1.5, '适度增强弱纹理；0 关闭，过强会放大噪声。'),
+            ('gamma', 'Gamma 亮度', .4, 2.5, .05, 1, '<1 提亮；>1 压暗。'),
+            ('denoise', '双边降噪强度', 0, 60, 2, 0, '默认关闭，以免抹去冰雪弱纹理。'),
+            ('sharpen', '轻度锐化', 0, 1, .05, 0, '默认关闭；过度锐化可能引入伪边缘。'),
+        ]
+        for name, label, low, high, step, default, tip in specs:
+            widget = QDoubleSpinBox()
+            widget.setRange(low, high)
+            widget.setSingleStep(step)
+            widget.setValue(default)
+            widget.setToolTip(tip)
+            widget.valueChanged.connect(self.queue_preview)
+            self.prep_widgets[name] = widget
+            form.addRow(label, widget)
+        edge = QSpinBox()
+        edge.setRange(0, 12000)
+        edge.setSingleStep(200)
+        edge.setValue(2400)
+        edge.setSpecialValueText('保留原尺寸')
+        edge.valueChanged.connect(self.queue_preview)
+        self.prep_widgets['max_edge'] = edge
+        form.addRow('输出最长边 / px', edge)
+        reset = QPushButton('恢复保守默认参数')
+        reset.clicked.connect(self.reset_preprocessing)
+        reset.setToolTip('实时预览为缩略图近似效果；实际任务使用统一参数，不修改原片；无法凭空补回真实纹理。')
+        form.addRow(reset)
+        layout.addWidget(box)
+
+    def _path_field(self, form, label, mode, initial=''):
+        field = QLineEdit(initial)
+        button = QPushButton('浏览')
+        button.setObjectName('browseButton')
+        button.setFixedWidth(52)
+        button.setFixedHeight(30)
+        button.setToolTip('选择文件或文件夹')
+        def choose():
+            if mode == 'dir':
+                value = QFileDialog.getExistingDirectory(self, label, field.text())
+            else:
+                value, _ = QFileDialog.getOpenFileName(self, label, field.text())
+            if value:
+                field.setText(value)
+        button.clicked.connect(choose)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(field)
+        row.addWidget(button)
+        form.addRow(label, row)
+        return field
+
+    def _algorithm_panel(self, layout):
+        box = FrostGroupBox('重建路径与输出')
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 12, 8, 6)
+        form.setVerticalSpacing(4)
+        form.setHorizontalSpacing(6)
+        # Long Windows paths deserve the full rail width: put field labels above inputs.
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.path_a = QCheckBox('路径 A · VGGT')
+        self.path_a.setChecked(True)
+        self.path_b = QCheckBox('路径 B · COLMAP + OpenMVS')
+        # The full label is useful, but at compact window widths its natural
+        # one-line size can force the entire scroll area wider than the rail.
+        self.path_b.setToolTip('路径 B：COLMAP + OpenMVS 传统多视图立体重建')
+        form.addRow(self.path_a)
+        form.addRow(self.path_b)
+        box.setToolTip('同时选中时顺序运行，复用同一批预处理图像。')
+        self.output = self._path_field(form, '结果保存目录', 'dir', str(Path(__file__).resolve().parents[1] / 'outputs'))
+        self.vggt_python = self._path_field(form, 'VGGT Python', 'file')
+        self.vggt_repo = self._path_field(form, 'VGGT 仓库目录', 'dir')
+        self.vggt_args = QLineEdit('[]')
+        self.vggt_args.setPlaceholderText('["--use_ba"]')
+        form.addRow('VGGT 参数 JSON', self.vggt_args)
+        self.colmap = self._path_field(form, 'COLMAP 程序', 'file', 'colmap')
+        self.openmvs = self._path_field(form, 'OpenMVS bin', 'dir')
+        self.colmap_extra = QLineEdit('{}')
+        self.openmvs_extra = QLineEdit('{}')
+        for label, field in [('COLMAP 阶段参数', self.colmap_extra), ('OpenMVS 阶段参数', self.openmvs_extra)]:
+            field.setToolTip('JSON 对象：阶段名 → 字符串参数数组。具体选项参见安装工具的 --help。')
+            form.addRow(label, field)
+        row = QHBoxLayout()
+        save = QPushButton('保存配置')
+        save.clicked.connect(self.save_settings)
+        load = QPushButton('加载配置')
+        load.clicked.connect(self.load_settings)
+        row.addWidget(save)
+        row.addWidget(load)
+        form.addRow(row)
+        detect_row = QHBoxLayout()
+        self.detect_button = QPushButton('自动检测工具')
+        self.detect_button.clicked.connect(self.auto_detect_tools)
+        scan = QPushButton('扫描指定目录')
+        scan.clicked.connect(self.choose_scan_roots)
+        detect_row.addWidget(self.detect_button)
+        detect_row.addWidget(scan)
+        form.addRow(detect_row)
+        self.candidates_button = QPushButton('选择工具版本')
+        self.candidates_button.setToolTip('选择自动检测到的工具路径和版本')
+        self.candidates_button.setEnabled(False)
+        self.candidates_button.clicked.connect(self.choose_detected_tools)
+        form.addRow(self.candidates_button)
+        self.discovery_label = QLabel('启动后自动查找已安装工具')
+        self.discovery_label.setWordWrap(True)
+        self.discovery_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.discovery_label.setMaximumHeight(62)
+        form.addRow(self.discovery_label)
+        layout.addWidget(box)
+
+    def _api_panel(self, layout):
+        box = FrostGroupBox('模型质量评价 API')
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 12, 8, 6)
+        form.setVerticalSpacing(4)
+        form.setHorizontalSpacing(6)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.api_enabled = QCheckBox('每条路径完成后自动上传并评价')
+        form.addRow(self.api_enabled)
+        self.api_url = QLineEdit()
+        self.api_url.setPlaceholderText('https://your-server.example/evaluate')
+        self.api_key = QLineEdit()
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.auth_header = QLineEdit('Authorization')
+        self.auth_prefix = QLineEdit('Bearer')
+        self.file_field = QLineEdit('model')
+        self.meta_field = QLineEdit('metadata')
+        self.result_path = QLineEdit()
+        self.result_path.setPlaceholderText('留空，或 data.result')
+        self.timeout = QSpinBox()
+        self.timeout.setRange(5, 1800)
+        self.timeout.setValue(120)
+        self.timeout.setSuffix(' 秒')
+        for label, field in [('API 完整地址', self.api_url), ('密钥（仅内存）', self.api_key),
+                             ('鉴权头名称', self.auth_header), ('鉴权前缀', self.auth_prefix),
+                             ('文件字段', self.file_field), ('元数据字段', self.meta_field),
+                             ('响应结果根路径', self.result_path), ('响应读取超时', self.timeout)]:
+            form.addRow(label, field)
+        box.setToolTip('POST multipart：上传模型 ZIP（模型、MTL、同目录/子目录贴图）与 metadata JSON。评分及指标由后端返回；启用即允许向该地址上传。')
+        layout.addWidget(box)
+
+    def _input_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        label = QLabel('将单张 / 多张照片拖到此处，也可以直接选择图片文件夹')
+        label.setObjectName('sectionTitle')
+        layout.addWidget(label)
+        row = QHBoxLayout()
+        for text, callback in [('选择图片', self.choose_files), ('选择文件夹', self.choose_folder),
+                               ('移除选中', self.remove_selected), ('清空列表', self.clear_images)]:
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            row.addWidget(button)
+        self.count_label = QLabel('0 张')
+        row.addWidget(self.count_label)
+        row.addStretch()
+        layout.addLayout(row)
+        self.drop = DropList()
+        self.drop.setObjectName('glassDropList')
+        self.drop.setMinimumHeight(96)
+        self.drop.files_dropped.connect(self.import_paths)
+        self.drop.currentRowChanged.connect(self.queue_preview)
+        layout.addWidget(self.drop, 1)
+        self.preview_note = QLabel('选择一张图像，调整左侧参数即可更新预览')
+        self.preview_note.setWordWrap(True)
+        self.drop.setToolTip(self.preview_note.text())
+        self.preview_note.hide()
+        pair = QHBoxLayout()
+        self.original_preview = self._preview_label('原图')
+        self.processed_preview = self._preview_label('预处理预览')
+        pair.addWidget(self.original_preview, 1)
+        pair.addWidget(self.processed_preview, 1)
+        layout.addLayout(pair, 3)
+        self.tabs.addTab(page, '① 图像与预处理')
+
+    def _preview_label(self, name):
+        label = FrostLabel(name)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumSize(160, 140)
+        label.setStyleSheet('background:transparent;border:0;color:#D5E4F1;')
+        return label
+
+    def _results_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        note = QLabel('并排检查两条路径的模型与后端指标。两种重建的坐标系/尺度可能不同；此页面不执行几何对齐。')
+        page.setToolTip(note.text())
+        note.hide()
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.viewers, self.eval_panels = {}, {}
+        for method, name in [('A', '路径 A · VGGT'), ('B', '路径 B · COLMAP + OpenMVS')]:
+            column = QWidget()
+            col = QVBoxLayout(column)
+            viewer = ModelViewer(name)
+            viewer.load_requested.connect(lambda m=method: self.load_model(m))
+            viewer.evaluate_requested.connect(lambda m=method: self.evaluate_model(m))
+            self.viewers[method] = viewer
+            self.eval_panels[method] = EvaluationPanel()
+            vertical = QSplitter(Qt.Orientation.Vertical)
+            vertical.addWidget(viewer)
+            vertical.addWidget(self.eval_panels[method])
+            vertical.setSizes([480, 260])
+            col.addWidget(vertical)
+            split.addWidget(column)
+        layout.addWidget(split, 1)
+        self.tabs.addTab(page, '② 模型与评价对比')
+
+    def _logs_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.run_path = QLabel('任务输出：尚未运行')
+        self.run_path.setWordWrap(True)
+        self.run_path.setTextFormat(Qt.TextFormat.PlainText)
+        self.run_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.run_path)
+        note = QLabel('进度按已完成阶段估算；单个 GPU 步骤可能长时间停留。完整日志及 manifest.json 保存在独立任务目录。')
+        page.setToolTip(note.text())
+        note.hide()
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(4000)
+        layout.addWidget(self.log)
+        self.tabs.addTab(page, '③ 任务日志')
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self.import_paths([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
+        event.acceptProposedAction()
+
+    def choose_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, '选择冰川影像', '',
+            '图像 (*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp)')
+        if files:
+            self.import_paths(files)
+
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择图像文件夹（递归导入）')
+        if folder:
+            self.import_paths([folder])
+
+    def import_paths(self, paths):
+        if not paths or self.job:
+            if self.job:
+                self.statusBar().showMessage('请等待当前任务完成，再导入新图像。')
+            return
+        def scan(report, check):
+            check()
+            found = collect_images(paths)
+            check()
+            return found
+        self.start_worker(scan, self.import_finished, primary=True)
+        self.stage_label.setText('扫描图像文件…')
+
+    def import_finished(self, found):
+        existing = set(self.drop.paths())
+        for path in found:
+            if path not in existing:
+                self.drop.addItem(str(path))
+                existing.add(path)
+        self.count_label.setText(f'{self.drop.count()} 张')
+        if self.drop.currentRow() < 0 and self.drop.count():
+            self.drop.setCurrentRow(0)
+        self.statusBar().showMessage(f'已加载 {self.drop.count()} 张图像；损坏文件会在预览或任务中报告。')
+
+    def remove_selected(self):
+        if self.job:
+            return
+        for item in self.drop.selectedItems():
+            self.drop.takeItem(self.drop.row(item))
+        self.count_label.setText(f'{self.drop.count()} 张')
+        self.queue_preview()
+
+    def clear_images(self):
+        if self.job:
+            return
+        self.drop.clear()
+        self.count_label.setText('0 张')
+        self.original_preview.setText('原图')
+        self.processed_preview.setText('预处理预览')
+        self.queue_preview()
+
+    def prep_config(self):
+        return PreprocessConfig(**{k: w.value() for k, w in self.prep_widgets.items()})
+
+    def tool_config(self):
+        return PipelineConfig(self.vggt_python.text().strip(), self.vggt_repo.text().strip(),
+            self.vggt_args.text(), self.colmap.text().strip(), self.openmvs.text().strip(),
+            self.colmap_extra.text(), self.openmvs_extra.text())
+
+    def api_config(self):
+        return APIConfig(self.api_enabled.isChecked(), self.api_url.text().strip(), self.api_key.text(),
+            self.auth_header.text().strip(), self.auth_prefix.text(), self.file_field.text().strip(),
+            self.meta_field.text().strip(), self.result_path.text().strip(), self.timeout.value())
+
+    def reset_preprocessing(self):
+        for key, value in asdict(PreprocessConfig()).items():
+            self.prep_widgets[key].setValue(value)
+
+    def queue_preview(self, *_):
+        self.preview_revision += 1
+        if hasattr(self, 'preview_timer'):
+            self.preview_timer.start()
+
+    def launch_preview(self):
+        item = self.drop.currentItem()
+        if not item or self.preview_worker or self.closing:
+            return
+        revision, path, cfg = self.preview_revision, item.text(), self.prep_config()
+        def compute(report, check):
+            rgb = read_rgb(path)
+            check()
+            saturated = float((rgb.max(axis=2) >= 250).mean() * 100)
+            original = resize_long_edge(rgb, 1100)
+            processed = preprocess(original, replace(cfg, max_edge=min(cfg.max_edge or 1100, 1100)))
+            check()
+            return (revision, original, processed, saturated, path)
+        worker = self.start_worker(compute, self.show_preview, primary=False,
+                                   error=lambda msg: self.preview_note.setText('预览失败：' + msg))
+        self.preview_worker = worker
+        worker.finished.connect(self.preview_finished)
+
+    def preview_finished(self):
+        self.preview_worker = None
+        # 参数变动发生在计算期间时，再计算最新快照，不堆积过时任务。
+        if getattr(self, 'displayed_revision', -1) != self.preview_revision and not self.closing:
+            self.preview_timer.start()
+
+    def show_preview(self, payload):
+        revision, original, processed, saturated, path = payload
+        self.displayed_revision = revision
+        if revision != self.preview_revision:
+            return
+        for array, label in [(original, self.original_preview), (processed, self.processed_preview)]:
+            h, w, _ = array.shape
+            image = QImage(array.data, w, h, array.strides[0], QImage.Format.Format_RGB888).copy()
+            label.setPixmap(QPixmap.fromImage(image).scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                                           Qt.TransformationMode.SmoothTransformation))
+        self.preview_note.setText(f'{Path(path).name} · 原图近高光像素 {saturated:.1f}%（任一 RGB 通道 ≥250，仅作提示）'
+                                 ' · 左：原图 / 右：缩略预览')
+
+    def start_worker(self, fn, result, primary=True, error=None):
+        worker = Worker(fn)
+        self.workers.add(worker)
+        worker.result.connect(result)
+        worker.error.connect(error or self.show_error)
+        worker.progress.connect(self.on_progress)
+        worker.finished.connect(self.worker_finished)
+        if primary:
+            self.job = worker
+            self.set_busy(True)
+        worker.start()
+        return worker
+
+    def auto_detect_tools(self):
+        """后台检测工具；保存过的有效路径优先，其次发现唯一路径才自动填入。"""
+        if self.job or self.closing:
+            return
+        fields = self.tool_path_fields()
+        current = {key: field.text().strip() for key, field in fields.items()}
+        self._detection_snapshot = dict(current)
+        # 保留文件夹对话框使用的 colmap.exe 当前值，以及仍然有效的路径。
+        for key in KEYS:
+            if is_tool_path(key, current[key]):
+                current[key] = str(Path(current[key]).expanduser().resolve())
+        self.detect_button.setEnabled(False)
+        self.discovery_label.setText('正在后台查找安装位置并检查 Python 依赖…')
+        self.stage_label.setText('搜索本机已安装工具…')
+        def scan(report, check):
+            return discover(Path(__file__).resolve().parents[1], current, report, check)
+        self.start_worker(scan, self.detection_finished, error=self.detection_failed)
+
+    def detection_finished(self, found):
+        self.detect_button.setEnabled(True)
+        candidates = found['candidates']
+        self.detected_tools = candidates
+        self.candidates_button.setEnabled(any(candidates.values()))
+        # 只自动填唯一候选；多个版本需要用户决定，不静默覆盖当前选择。
+        for key, values in candidates.items():
+            field = self.tool_path_fields()[key]
+            value = field.text().strip()
+            if value == self._detection_snapshot.get(key) and not is_tool_path(key, value) and len(values) == 1:
+                field.setText(values[0])
+        labels = {'vggt_python': 'VGGT Python', 'vggt_repo': 'VGGT 仓库',
+                  'colmap': 'COLMAP', 'openmvs_bin': 'OpenMVS'}
+        # 给用户看匹配来源/未发现原因和依赖检查结果，而不是把“路径存在”描述成“环境可运行”。
+        summary, configured = [], {}
+        for key, values in candidates.items():
+            label = labels[key]
+            field = self.tool_path_fields()[key]
+            if is_tool_path(key, field.text().strip()):
+                detail = found.get('python_checks', {}).get(str(Path(field.text()).resolve()), '')
+                configured[label] = f'{field.text()} ({detail})' if detail else f'{field.text()} (程序文件已找到，运行环境待验证)'
+                summary.append(f'{label}：已找到并配置')
+            elif len(values) > 1:
+                summary.append(f'{label}：找到 {len(values)} 个版本，点击“选择检测结果 / 版本”')
+            elif not values:
+                summary.append(f'{label}：未找到匹配项，可扫描指定目录')
+        failed_python = [(path, reason) for path, reason in found.get('python_checks', {}).items()
+                         if not reason.startswith('核心依赖存在')]
+        unusable = [f'{path}：{reason}' for path, reason in failed_python]
+        notes = list(found.get('notes', []))
+        if unusable:
+            notes.append(f'另有 {len(unusable)} 个 Python 候选缺少依赖或不可启动，完整详情见日志。')
+        self.stage_label.setText('工具检测完成')
+        self.discovery_label.setText(' · '.join(summary + notes) or '未发现工具，请使用“扫描指定目录”。')
+        self.log.appendPlainText('工具检测完成：' + (self.discovery_label.text()))
+        for name, path in configured.items():
+            self.log.appendPlainText(f'{name}：{path}')
+        for path, message in found.get('python_checks', {}).items():
+            self.log.appendPlainText(f'Python 环境检查：{path} · {message}')
+        for item in unusable:
+            self.log.appendPlainText('Python 候选不可用：' + item)
+        self.log.appendPlainText(f'扫描目录数：{found.get("directories_scanned", 0)}')
+        self.cache_tool_paths()
+
+    def detection_failed(self, message):
+        self.detect_button.setEnabled(True)
+        self.stage_label.setText('工具检测失败')
+        self.discovery_label.setText('检测未完成：' + message)
+        self.log.appendPlainText('自动检测失败：' + message)
+
+    def choose_scan_roots(self):
+        """用户明确选择目录后才扩大搜索范围。"""
+        if self.job:
+            return
+        folders = QFileDialog.getExistingDirectory(self, '选择要扫描的安装/工作目录')
+        if not folders:
+            return
+        fields = {'vggt_python': self.vggt_python, 'vggt_repo': self.vggt_repo,
+                  'colmap': self.colmap, 'openmvs_bin': self.openmvs}
+        current = {key: field.text().strip() if is_tool_path(key, field.text().strip()) else ''
+                   for key, field in fields.items()}
+        self._detection_snapshot = {key: field.text().strip() for key, field in fields.items()}
+        self.detect_button.setEnabled(False)
+        self.stage_label.setText('正在扫描所选目录…')
+        def scan(report, check):
+            return discover(Path(__file__).resolve().parents[1], current, report, check,
+                            roots=[Path(folders)], scan_seconds=60, max_dirs=60000)
+        self.start_worker(scan, self.detection_finished, error=self.detection_failed)
+
+    def tool_path_fields(self):
+        return {'vggt_python': self.vggt_python, 'vggt_repo': self.vggt_repo,
+                'colmap': self.colmap, 'openmvs_bin': self.openmvs}
+
+    def choose_detected_tools(self):
+        if self.job:
+            return
+        labels = {'vggt_python': 'VGGT Python', 'vggt_repo': 'VGGT 仓库',
+                  'colmap': 'COLMAP', 'openmvs_bin': 'OpenMVS'}
+        keys = [key for key, values in self.detected_tools.items() if values]
+        if not keys:
+            return
+        label, ok = QInputDialog.getItem(self, '选择检测结果', '选择要配置的工具：',
+                                        [labels[key] for key in keys], 0, False)
+        if not ok:
+            return
+        key = next(k for k in keys if labels[k] == label)
+        choices = self.detected_tools[key]
+        field = self.tool_path_fields()[key]
+        index = choices.index(field.text()) if field.text() in choices else 0
+        value, ok = QInputDialog.getItem(self, label, '选择安装版本：', choices, index, False)
+        if ok:
+            field.setText(value)
+            self.cache_tool_paths()
+            self.statusBar().showMessage(label + ' 已选择并记住，下次启动自动恢复。')
+
+    def tool_cache_path(self):
+        return Path(__file__).resolve().parents[1] / '.local' / 'tool_paths.json'
+
+    def cache_tool_paths(self):
+        try:
+            path = self.tool_cache_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            save_json(path, {'tools': {k: f.text().strip() for k, f in self.tool_path_fields().items()}})
+        except OSError as exc:
+            self.log.appendPlainText('工具路径无法记住：' + str(exc))
+
+    def restore_tool_paths(self):
+        path = self.tool_cache_path()
+        if not path.is_file():
+            return
+        try:
+            saved = json.loads(path.read_text(encoding='utf-8'))['tools']
+            for key, field in self.tool_path_fields().items():
+                value = saved.get(key, '')
+                if isinstance(value, str) and is_tool_path(key, value):
+                    field.setText(value)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.log.appendPlainText('无法恢复上次工具路径，将重新检测：' + str(exc))
+
+    def worker_finished(self):
+        worker = self.sender()
+        if worker is self.job:
+            self.job = None
+            self.set_busy(False)
+        self.workers.discard(worker)
+        worker.deleteLater()
+        if self.closing and not self.workers:
+            QTimer.singleShot(0, self.close)
+
+    def set_busy(self, busy):
+        self.run_button.setEnabled(not busy)
+        self.cancel_button.setEnabled(busy)
+        for method, viewer in self.viewers.items():
+            viewer.eval_button.setEnabled(not busy and method in self.models)
+        if not busy and self.progress.maximum() == 0:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+        if not busy:
+            self.stage_label.setText('就绪 · 详情见日志')
+
+    def start(self):
+        methods = [m for m, box in [('A', self.path_a), ('B', self.path_b)] if box.isChecked()]
+        if len(self.drop.paths()) < 2 or not methods or not self.output.text().strip():
+            QMessageBox.warning(self, '输入不完整', '重建需要至少两张照片、至少一条路径和结果保存目录。')
+            return
+        self.log.clear()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        for method in methods:
+            self.eval_panels[method].reset('等待本次重建')
+        task = reconstruction_task(self.drop.paths(), self.output.text().strip(), methods,
+                                   self.prep_config(), self.tool_config(), self.api_config())
+        self.start_worker(task, self.task_finished)
+        self.tabs.setCurrentIndex(2)
+        self.statusBar().showMessage('任务使用启动时的配置快照；后续调参仅影响下一次任务。')
+
+    def task_finished(self, result):
+        manifest = result['manifest']
+        self.log.appendPlainText('任务结束：' + manifest['status'] + ' · ' + result['run_dir'])
+        if any(r['status'] == 'success' for r in manifest['results'].values()):
+            self.tabs.setCurrentIndex(1)
+
+    def cancel(self):
+        if self.job:
+            self.job.cancel()
+            self.cancel_button.setEnabled(False)
+            self.stage_label.setText('正在取消…')
+            self.log.appendPlainText('已请求取消。HTTP 等待中的取消将在响应返回或读取超时后生效。')
+
+    def show_error(self, message):
+        self.log.appendPlainText('任务信息：' + message)
+        self.statusBar().showMessage(message)
+
+    def on_progress(self, item):
+        typ = item.get('type')
+        if typ == 'log':
+            self.log.appendPlainText(item['text'])
+        elif typ == 'run':
+            self.run_path.setText('任务输出：' + item['path'])
+        elif typ == 'progress':
+            value = item.get('value')
+            self.progress.setRange(0, 0 if value is None else 100)
+            if value is not None:
+                self.progress.setValue(value)
+            self.stage_label.setText(item.get('text', ''))
+        elif typ == 'discovery_status':
+            self.stage_label.setText(item.get('text', '搜索工具…'))
+        elif typ == 'model':
+            self.display_model(item['method'], item['path'])
+        elif typ == 'evaluation':
+            self.evaluations[item['method']] = item['data']
+            self.eval_panels[item['method']].display(item['data'])
+        elif typ == 'evaluation_error':
+            self.eval_panels[item['method']].reset('评价失败，可重试')
+            self.eval_panels[item['method']].text.setPlainText(item['text'])
+            self.log.appendPlainText('评价失败：' + item['text'])
+
+    def load_model(self, method):
+        if self.job:
+            self.statusBar().showMessage('请等待当前任务结束后加载其他模型。')
+            return
+        path, _ = QFileDialog.getOpenFileName(self, '加载模型（贴图须保留相对路径）',
+                                            self.output.text(), '三维模型 (*.obj *.ply)')
+        if path:
+            self.display_model(method, path)
+
+    def display_model(self, method, path):
+        self.models[method] = str(path)
+        self.evaluations.pop(method, None)
+        self.eval_panels[method].reset('尚未评价')
+        try:
+            self.viewers[method].load_model(path)
+        except Exception as exc:
+            self.log.appendPlainText(f'模型已保存，但显示失败：{exc} · {path}')
+        self.viewers[method].eval_button.setEnabled(self.job is None)
+
+    def evaluate_model(self, method):
+        if self.job or method not in self.models:
+            return
+        cfg = self.api_config()
+        try:
+            validate_api(cfg)
+        except Exception as exc:
+            QMessageBox.warning(self, 'API 配置不完整', str(exc))
+            return
+        model = self.models[method]
+        def call(report, check):
+            report({'type': 'progress', 'value': None, 'text': '上传模型 / 等待 API'})
+            return evaluate(model, {'method': method, 'model_name': Path(model).name}, cfg, check)
+        def done(payload):
+            self.evaluations[method] = payload
+            self.eval_panels[method].display(payload)
+            self.log.appendPlainText(f'路径 {method} 评价完成。')
+        self.start_worker(call, done, error=lambda msg: self.evaluation_failed(method, msg))
+
+    def evaluation_failed(self, method, message):
+        self.eval_panels[method].reset('评价失败，可重试')
+        self.eval_panels[method].text.setPlainText(message)
+        self.show_error(message)
+
+    def save_settings(self):
+        path, _ = QFileDialog.getSaveFileName(self, '保存非敏感配置', 'glacier_settings.json', 'JSON (*.json)')
+        if path:
+            try:
+                # API 地址和密钥都不落盘，避免 URL 中的 token 被无意持久化。
+                save_json(path, {'version': 1, 'output': self.output.text(), 'tools': asdict(self.tool_config()),
+                                 'preprocessing': asdict(self.prep_config())})
+                self.statusBar().showMessage('工具和预处理配置已保存；API 地址和密钥未写入文件。')
+            except Exception as exc:
+                QMessageBox.warning(self, '保存失败', str(exc))
+
+    def load_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, '加载配置', '', 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            cfg = json.loads(Path(path).read_text(encoding='utf-8'))
+            tools = PipelineConfig(**cfg.get('tools', {}))
+            prep = PreprocessConfig(**cfg.get('preprocessing', {}))
+            fields = {'vggt_python': self.vggt_python, 'vggt_repo': self.vggt_repo, 'vggt_args': self.vggt_args,
+                      'colmap': self.colmap, 'openmvs_bin': self.openmvs,
+                      'colmap_extras': self.colmap_extra, 'openmvs_extras': self.openmvs_extra}
+            for key, value in asdict(tools).items():
+                fields[key].setText(str(value))
+            for key, value in asdict(prep).items():
+                self.prep_widgets[key].setValue(value)
+            self.output.setText(str(cfg.get('output', self.output.text())))
+            self.cache_tool_paths()
+        except Exception as exc:
+            QMessageBox.warning(self, '配置加载失败', str(exc))
+
+    def closeEvent(self, event):
+        if self.workers:
+            # 不强行 terminate QThread；先结束子进程/请求，再安全关闭 VTK。
+            self.closing = True
+            self.preview_timer.stop()
+            for worker in self.workers:
+                worker.cancel()
+            self.stage_label.setText('等待后台退出后关闭…')
+            event.ignore()
+            return
+        for viewer in self.viewers.values():
+            viewer.shutdown()
+        self.cache_tool_paths()
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'title_label'):
+            self.title_label.setStyleSheet(
+                'font-size:28px;font-weight:700;color:#FFFFFF;' if self.width() < 1180
+                else 'font-size:28px;font-weight:700;color:#FFFFFF;')
+
+
+STYLE = """
+QWidget { font-family:'Montserrat','Microsoft YaHei UI','Segoe UI'; font-size:13px; color:#F2F1EE; background:transparent; }
+QMainWindow { background:#08090C; }
+QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }
+QSplitter::handle { background:transparent; }
+QGroupBox { font-size:16px; font-weight:500; border:0; border-radius:10px; margin-top:12px; padding:8px 2px 8px; background:transparent; }
+QGroupBox::title { subcontrol-origin:margin; left:18px; padding:0 8px; color:#CEC8BB; }
+QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(211,230,247,20),stop:0.12 rgba(132,164,192,13),stop:1 rgba(174,201,224,10)); border:1px solid rgba(214,232,248,43); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#4D6BFE; alternate-background-color:rgba(255,255,255,8); }
+QListWidget#glassDropList { background:transparent; border:0; }
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border:1px solid #4D6BFE; }
+QListWidget::item { padding:7px 8px; border-radius:8px; }
+QListWidget::item:selected, QTableWidget::item:selected { background:rgba(77,107,254,65); color:#FFFFFF; }
+QHeaderView::section { background:rgba(255,255,255,10); color:#CEC8BB; border:0; padding:8px; }
+QPushButton { min-height:20px; background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(241,247,252,235),stop:1 rgba(207,221,234,225)); color:#17202A; border:1px solid rgba(245,250,255,215); border-radius:100px; padding:4px 12px; font-size:12px; }
+QPushButton#browseButton { min-height:24px; padding:2px 4px; font-size:12px; border-radius:100px; }
+QPushButton:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #FFFFFF,stop:1 #E3EDF5); border-color:#E8F2FA; }
+QPushButton:pressed { background:#BEB7A8; }
+QPushButton:disabled { color:rgba(26,22,21,105); background:rgba(255,255,255,105); border-color:rgba(255,255,255,80); }
+QPushButton#primaryButton { background:#FFFFFF; color:#1A1615; border:1px solid #FFFFFF; font-weight:700; padding:8px 24px; }
+QPushButton#primaryButton:hover { background:#CEC8BB; border-color:#CEC8BB; }
+QTabWidget::pane { border:0; background:transparent; top:-1px; }
+QTabWidget#glassTabs::pane { border:0; background:transparent; }
+QScrollArea#glassRail { border:0; background:transparent; }
+QTabBar::tab { color:rgba(220,234,248,190); background:transparent; border:1px solid transparent; border-radius:100px; padding:6px 12px; margin:3px; font-size:12px; }
+QTabBar::tab:selected { color:#FFFFFF; background:rgba(77,107,254,42); border-color:rgba(77,107,254,115); }
+QProgressBar { border:1px solid rgba(255,255,255,48); border-radius:100px; text-align:center; min-height:16px; background:rgba(255,255,255,12); color:#FFFFFF; }
+QProgressBar::chunk { background:#AEC7D9; border-radius:100px; }
+QCheckBox { spacing:10px; }
+QCheckBox::indicator { width:18px; height:18px; border-radius:5px; border:1px solid rgba(255,255,255,100); background:rgba(255,255,255,12); }
+QCheckBox::indicator:checked { background:#4D6BFE; border-color:#4D6BFE; }
+QScrollBar:vertical { background:transparent; width:10px; margin:4px; }
+QScrollBar::handle:vertical { background:rgba(255,255,255,60); border-radius:5px; min-height:28px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+QStatusBar { font-size:11px; color:#95A6B8; background:transparent; }
+QToolTip { color:#FFFFFF; background:#151923; border:1px solid rgba(255,255,255,65); border-radius:8px; padding:6px; }
+QLabel#appTitle { font-size:28px; font-weight:700; color:#FFFFFF; }
+QLabel#subtitle { color:rgba(220,234,248,175); font-size:12px; }
+QLabel#eyebrow { color:#D2DFEB; font-size:16px; font-weight:500; letter-spacing:2px; }
+QLabel#statusText { color:#C7D8E8; font-size:11px; }
+QLabel#sectionTitle { font-size:16px; font-weight:600; color:#FFFFFF; }
+QLabel#hint { color:rgba(215,230,245,155); font-size:11px; }
+"""
+
+
+def run():
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(STYLE)
+    window = MainWindow()
+    window.show()
+    return app.exec()
