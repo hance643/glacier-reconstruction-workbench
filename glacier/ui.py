@@ -6,13 +6,14 @@ import re
 import shutil
 
 import math
+import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRect, QRectF
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QRegion,
                             QPen, QRadialGradient, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QInputDialog,
+    QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QInputDialog, QSlider,
     QSpinBox, QStyle, QStyleOptionGroupBox, QTabBar, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -468,6 +469,7 @@ class MainWindow(QMainWindow):
         self.last_run = None
         self.pending_cleanup_run = None
         self.closing = False
+        self._active_vggt_dialog = None
         self._build()
         # 窗口先显示，再在工作线程恢复/发现工具，避免遍历安装目录卡住 GUI。
         QTimer.singleShot(300, self.auto_detect_tools)
@@ -1292,6 +1294,8 @@ class MainWindow(QMainWindow):
     def cancel(self):
         if self.job:
             self.job.cancel()
+            if self._active_vggt_dialog is not None:
+                self._active_vggt_dialog.reject()
             self.cancel_button.setEnabled(False)
             self.stage_label.setText('正在取消…')
             self.log.appendPlainText('已请求取消。HTTP 等待中的取消将在响应返回或读取超时后生效。')
@@ -1318,6 +1322,8 @@ class MainWindow(QMainWindow):
             self.stage_label.setText(item.get('text', '搜索工具…'))
         elif typ == 'model':
             self.display_model(item['method'], item['path'])
+        elif typ == 'vggt_preview':
+            self.open_vggt_confidence_preview(item)
         elif typ == 'evaluation':
             self.evaluations[item['method']] = item['data']
             self.eval_panels[item['method']].display(item['data'])
@@ -1345,6 +1351,89 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText(f'模型已保存，但显示失败：{exc} · {path}')
         self.viewers[method].eval_button.setEnabled(self.job is None)
         self.save_session()
+
+    def open_vggt_confidence_preview(self, request):
+        """Let the user compare confidence filters before committing the VGGT PLY."""
+        path = Path(request['path'])
+        try:
+            with np.load(path) as archive:
+                points = np.asarray(archive['points'], dtype=np.float32)
+                colors = np.asarray(archive['colors'], dtype=np.uint8)
+                confidence = np.asarray(archive['confidence'], dtype=np.float32)
+            valid = np.isfinite(confidence) & np.isfinite(points).all(axis=1)
+            points, colors, confidence = points[valid], colors[valid], confidence[valid]
+            if not len(points):
+                raise ValueError('VGGT 没有生成有效的置信度点云。')
+            preview_count = min(len(points), 100000)
+            preview_indices = np.linspace(0, len(points) - 1, preview_count, dtype=np.int64)
+            preview_points = points[preview_indices]
+            preview_colors = colors[preview_indices]
+            preview_confidence = confidence[preview_indices]
+            del points, colors
+            dialog = QDialog(self)
+            self._active_vggt_dialog = dialog
+            dialog.setWindowTitle('VGGT 置信度预览 · 确认后保存')
+            dialog.resize(980, 720)
+            layout = QVBoxLayout(dialog)
+            viewer = ModelViewer('拖动阈值，对比 VGGT 点云效果', dialog,
+                                 auto_rotate=False, standalone=True)
+            viewer.load_button.hide()
+            viewer.eval_button.hide()
+            viewer.reset_button.hide()
+            viewer.zoom_button.hide()
+            viewer.setMinimumHeight(430)
+            layout.addWidget(viewer, 1)
+            controls = QHBoxLayout()
+            controls.addWidget(QLabel('置信度百分位'))
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(0, 99)
+            slider.setValue(35)
+            slider.setMinimumWidth(300)
+            controls.addWidget(slider, 1)
+            value_label = QLabel()
+            controls.addWidget(value_label)
+            layout.addLayout(controls)
+            detail = QLabel(f'滑块越往右，过滤越严格。界面用均匀抽取的最多10万个点快速预览；确认后将阈值 {"按全部有效 VGGT 点的置信度分布计算"} 并应用到完整点云。')
+            detail.setWordWrap(True)
+            layout.addWidget(detail)
+            buttons = QHBoxLayout()
+            save_button = QPushButton('确认并保存所选效果')
+            save_button.setObjectName('primaryButton')
+            cancel_button = QPushButton('取消本次 VGGT')
+            buttons.addStretch()
+            buttons.addWidget(cancel_button)
+            buttons.addWidget(save_button)
+            layout.addLayout(buttons)
+            selected = {'percentile': 35}
+
+            def update_preview(value):
+                threshold = (float(np.min(confidence)) if value == 0 else
+                             float(np.percentile(confidence, value)))
+                preview_mask = preview_confidence >= threshold
+                full_kept = int(np.count_nonzero(confidence >= threshold))
+                selected['percentile'] = value
+                value_label.setText(f'阈值 {threshold:.3f} · 预览 {int(preview_mask.sum()):,}/{len(preview_mask):,} · 全量保留 {full_kept:,}（最多导出100,000）')
+                viewer.set_point_cloud_data(preview_points[preview_mask], preview_colors[preview_mask])
+
+            slider.valueChanged.connect(update_preview)
+            update_preview(slider.value())
+            save_button.clicked.connect(dialog.accept)
+            cancel_button.clicked.connect(dialog.reject)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            self._active_vggt_dialog = None
+            viewer.shutdown()
+            request['percentile'] = selected['percentile'] if accepted else None
+            request['cancelled'] = not accepted
+            request['decision'].set()
+            if accepted:
+                self.statusBar().showMessage('已确认置信度效果，正在写入最终 VGGT 点云…')
+            else:
+                self.log.appendPlainText('已取消 VGGT 置信度预览；不会保存该路径模型。')
+        except Exception as exc:
+            self._active_vggt_dialog = None
+            request['cancelled'] = True
+            request['decision'].set()
+            self.show_error(f'无法打开 VGGT 置信度预览，未保存模型：{exc}')
 
     def evaluate_model(self, method):
         if self.job or method not in self.models:
@@ -1477,7 +1566,23 @@ QLabel#hint { color:rgba(215,230,245,155); font-size:11px; }
 
 
 def run():
+    # Windows otherwise identifies the running window through pythonw.exe,
+    # which can leave its taskbar button with the interpreter's blank icon.
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'GlacierReconstruction.DesktopApp')
+        except (AttributeError, OSError):
+            pass
     app = QApplication.instance() or QApplication([])
+    app.setApplicationName('冰川三维重建')
+    app.setOrganizationName('GlacierReconstruction')
+    icon_path = Path(__file__).resolve().parent.parent / 'assets' / 'glacier_icon.ico'
+    if icon_path.is_file():
+        app_icon = QIcon(str(icon_path))
+        app.setWindowIcon(app_icon)
+        app.setProperty('glacier_icon_path', str(icon_path))
     app.setStyleSheet(STYLE)
     window = MainWindow()
     window.show()

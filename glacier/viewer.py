@@ -20,7 +20,7 @@ try:
     from vtkmodules.vtkRenderingCore import vtkRenderer, vtkPolyDataMapper, vtkActor
     # vtkPoints is defined in vtkCommonCore; vtkCellArray/PolyData belong to
     # vtkCommonDataModel in the VTK 9.7 wheels used by the bundled environment.
-    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonCore import vtkPoints, vtkUnsignedCharArray
     from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
     from vtkmodules.vtkIOPLY import vtkPLYReader
     from vtkmodules.vtkIOImport import vtkOBJImporter
@@ -81,18 +81,19 @@ class ModelViewer(QWidget):
         heading.setObjectName('sectionTitle')
         layout.addWidget(heading)
         row = QHBoxLayout()
-        load = QPushButton('加载 OBJ / PLY')
-        load.clicked.connect(self.load_requested.emit)
-        row.addWidget(load)
+        self.load_button = QPushButton('加载 OBJ / PLY')
+        self.load_button.clicked.connect(self.load_requested.emit)
+        row.addWidget(self.load_button)
         self.eval_button = QPushButton('评价 / 重试')
         self.eval_button.setEnabled(False)
         self.eval_button.clicked.connect(self.evaluate_requested.emit)
         row.addWidget(self.eval_button)
         reset = QPushButton('重置视角')
+        self.reset_button = reset
         reset.clicked.connect(self.reset_camera)
         row.addWidget(reset)
         if standalone:
-            load.hide()
+            self.load_button.hide()
             self.eval_button.hide()
         layout.addLayout(row)
         if standalone and vggt_controls:
@@ -531,6 +532,42 @@ class ModelViewer(QWidget):
         self.reset_camera()
         if self.auto_rotate and self.isVisible() and not self.spin_timer.isActive():
             self.spin_timer.start()
+
+    def set_point_cloud_data(self, points, colors):
+        """Show an in-memory VGGT confidence-filter preview without saving it."""
+        if not VTK_AVAILABLE:
+            raise RuntimeError('VTK 未加载，无法预览 VGGT 点云。')
+        points = np.ascontiguousarray(points, dtype=np.float32)
+        colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points):
+            raise ValueError('当前置信度没有保留任何有效点。')
+        if colors.shape != points.shape:
+            raise ValueError('候选点与颜色数据不匹配。')
+        self.renderer.RemoveAllViewProps()
+        vtk_points = vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(points, deep=True))
+        poly = vtkPolyData()
+        poly.SetPoints(vtk_points)
+        vtk_colors = numpy_to_vtk(colors, deep=True, array_type=vtkUnsignedCharArray().GetDataType())
+        vtk_colors.SetName('RGB')
+        poly.GetPointData().SetScalars(vtk_colors)
+        glyph = vtkVertexGlyphFilter()
+        glyph.SetInputData(poly)
+        glyph.Update()
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(glyph.GetOutputPort())
+        mapper.SetColorModeToDirectScalars()
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetPointSize(3)
+        self.renderer.AddActor(actor)
+        self.actors = [actor]
+        self.textures = [None]
+        self.hold = [glyph]
+        self.renderer.ResetCamera()
+        self.canvas.GetRenderWindow().Render()
+        self.caption.setText(f'候选预览 · {len(points):,} 个点（确认后才写入最终模型）')
+        self.caption.setToolTip('')
 
     def update_style(self):
         if not VTK_AVAILABLE:

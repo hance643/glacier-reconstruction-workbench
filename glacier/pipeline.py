@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import psutil
+import numpy as np
 
 
 class Cancelled(RuntimeError):
@@ -111,12 +112,14 @@ def terminate_tree(process):
         process.wait(timeout=5)
 
 
-def run_process(argv, cwd, emit, check_cancel):
+def run_process(argv, cwd, emit, check_cancel, extra_env=None):
     """日志读取与轮询分离；工具完全不输出日志时，仍可及时取消。"""
     check_cancel()
     emit('命令：' + subprocess.list2cmdline([str(a) for a in argv]))
     env = os.environ.copy()
     env.update(PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
     env['PATH'] = str(Path(argv[0]).parent) + os.pathsep + env.get('PATH', '')
     env.pop('QT_PLUGIN_PATH', None)
     env.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
@@ -177,7 +180,68 @@ def registered_count(folder):
     return 0
 
 
-def run_vggt(images, output_dir, cfg, emit, stage, check_cancel):
+def _make_vggt_preview_script(source):
+    """Add a temporary raw-confidence export without editing the user's VGGT checkout."""
+    anchor = '        conf_mask = depth_conf >= conf_thres_value\n'
+    injected = '''        # Glacier Studio: export a representative raw confidence sample for the GUI review.
+        glacier_points = points_3d.reshape(-1, 3)
+        glacier_colors = points_rgb.reshape(-1, 3)
+        glacier_confidence = depth_conf.reshape(-1)
+        np.savez_compressed(
+            os.environ["GLACIER_VGGT_PREVIEW"],
+            points=glacier_points.astype(np.float32),
+            colors=glacier_colors.astype(np.uint8),
+            confidence=glacier_confidence.astype(np.float32),
+        )
+'''
+    if source.count(anchor) != 1:
+        raise RuntimeError('当前 VGGT demo_colmap.py 的置信度导出位置无法识别，不能安全打开交互预览。')
+    return source.replace(anchor, injected + anchor, 1)
+
+
+def _write_confidence_preview_ply(path, archive_path, percentile, check_cancel=lambda: None):
+    """Save exactly the confidence-filtered points the user saw in the preview."""
+    with np.load(archive_path) as archive:
+        points = np.asarray(archive['points'], dtype=np.float32)
+        colors = np.asarray(archive['colors'], dtype=np.uint8)
+        confidence = np.asarray(archive['confidence'], dtype=np.float32)
+    threshold = (float(np.min(confidence)) if float(percentile) == 0 else
+                 float(np.percentile(confidence, float(percentile))))
+    kept_points, kept_colors = [], []
+    for start in range(0, len(points), 250000):
+        check_cancel()
+        end = min(start + 250000, len(points))
+        keep = (np.isfinite(confidence[start:end]) & (confidence[start:end] >= threshold)
+                & np.isfinite(points[start:end]).all(axis=1))
+        if np.any(keep):
+            kept_points.append(points[start:end][keep])
+            kept_colors.append(colors[start:end][keep])
+    points = np.concatenate(kept_points) if kept_points else np.empty((0, 3), dtype=np.float32)
+    colors = np.concatenate(kept_colors) if kept_colors else np.empty((0, 3), dtype=np.uint8)
+    if not len(points):
+        raise RuntimeError('所选置信度阈值没有留下有效点；请降低阈值重试。')
+    if len(points) > 100000:
+        sample = np.linspace(0, len(points) - 1, 100000, dtype=np.int64)
+        points, colors = points[sample], colors[sample]
+    if colors.shape[1] > 3:
+        colors = colors[:, :3]
+    vertex_dtype = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')])
+    vertices = np.empty(len(points), dtype=vertex_dtype)
+    for index, name in enumerate(('x', 'y', 'z')):
+        vertices[name] = points[:, index]
+    for index, name in enumerate(('red', 'green', 'blue')):
+        vertices[name] = colors[:, index]
+    header = (f'ply\nformat binary_little_endian 1.0\n'
+              f'element vertex {len(vertices)}\n'
+              'property float x\nproperty float y\nproperty float z\n'
+              'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
+    Path(path).write_bytes(header.encode('ascii') + vertices.tobytes())
+    return {'threshold': threshold, 'kept_points': int(len(points)),
+            'sample_points': int(len(confidence)), 'export_cap': 100000}
+
+
+def run_vggt(images, output_dir, cfg, emit, stage, check_cancel, preview_callback=None):
     scene = output_dir / 'scene'
     repo = Path(cfg.vggt_repo).expanduser().resolve()
     stage(0, 1, 'VGGT 推理 / COLMAP 导出')
@@ -185,14 +249,28 @@ def run_vggt(images, output_dir, cfg, emit, stage, check_cancel):
     # its output path contains non-ASCII characters. Run it in the ASCII system
     # temp directory, then copy its completed scene back to the user's run folder.
     with tempfile.TemporaryDirectory(prefix='glacier_vggt_') as temporary:
+        temporary = Path(temporary)
         temporary_scene = Path(temporary) / 'scene'
         temporary_images = temporary_scene / 'images'
         temporary_images.mkdir(parents=True)
         for path in sorted(images.glob('*.png')):
             check_cancel()
             shutil.copy2(path, temporary_images / path.name)
-        run_process([executable(cfg.vggt_python), repo / 'demo_colmap.py', '--scene_dir', temporary_scene,
-                     *argument_list(cfg.vggt_args)], repo, emit, check_cancel)
+        runner = repo / 'demo_colmap.py'
+        extra_env = None
+        preview_archive = temporary_scene / 'glacier_confidence_preview.npz'
+        args = argument_list(cfg.vggt_args)
+        interactive_preview = preview_callback is not None and '--use_ba' not in args
+        if interactive_preview:
+            runner = temporary / 'demo_colmap_glacier_preview.py'
+            runner.write_text(_make_vggt_preview_script((repo / 'demo_colmap.py').read_text(encoding='utf-8')),
+                              encoding='utf-8')
+            extra_env = {'GLACIER_VGGT_PREVIEW': str(preview_archive),
+                         'PYTHONPATH': str(repo) + os.pathsep + os.environ.get('PYTHONPATH', '')}
+        elif preview_callback is not None:
+            emit('VGGT --use_ba 模式暂不支持置信度预览选择；继续使用 VGGT 默认 BA 导出。')
+        run_process([executable(cfg.vggt_python), runner, '--scene_dir', temporary_scene,
+                     *args], repo, emit, check_cancel, extra_env)
         candidate = temporary_scene / 'sparse' / 'points.ply'
         if not candidate.is_file():
             candidates = sorted(temporary_scene.rglob('*.ply'))
@@ -200,12 +278,29 @@ def run_vggt(images, output_dir, cfg, emit, stage, check_cancel):
                 raise RuntimeError('VGGT 已退出，但没有唯一可识别的 PLY 输出，请检查所安装版本及日志。')
             candidate = candidates[0]
         candidate_relative = candidate.relative_to(temporary_scene)
-        shutil.copytree(temporary_scene, scene, dirs_exist_ok=True)
+        if interactive_preview:
+            # Keep the unconfirmed raw point cloud in the temporary directory;
+            # copy camera/reconstruction metadata, then write only the user's
+            # selected cloud after the preview dialog is accepted.
+            shutil.copytree(temporary_scene, scene, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns('points.ply'))
+        else:
+            shutil.copytree(temporary_scene, scene, dirs_exist_ok=True)
     candidate = scene / candidate_relative
     model_dir = output_dir / 'model'
     model_dir.mkdir()
     model = model_dir / 'vggt_points.ply'
-    shutil.copy2(candidate, model)
+    if interactive_preview:
+        scene_preview = scene / preview_archive.name
+        if not scene_preview.is_file():
+            raise RuntimeError('VGGT 未生成置信度预览数据；没有保存未经确认的模型。')
+        percentile = preview_callback(scene_preview)
+        selected = _write_confidence_preview_ply(model, scene_preview, percentile, check_cancel)
+        _write_confidence_preview_ply(scene / candidate_relative, scene_preview, percentile, check_cancel)
+        scene_preview.unlink(missing_ok=True)
+        emit(f"已按你确认的置信度保存模型：阈值 {selected['threshold']:.3f}，保留 {selected['kept_points']:,}/{selected['sample_points']:,} 个预览采样点。")
+    else:
+        shutil.copy2(candidate, model)
     stage(1, 1, 'VGGT 点云导出完成')
     return model
 

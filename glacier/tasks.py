@@ -3,6 +3,7 @@ from dataclasses import asdict
 from datetime import datetime
 import json
 from pathlib import Path
+import threading
 import uuid
 
 from .evaluation import evaluate, validate_api
@@ -77,7 +78,22 @@ def reconstruction_task(paths, output, methods, prep, tools, api):
                         report({'type': 'progress', 'value': value, 'text': f'路径 {method} · {text}'})
                     try:
                         runner = run_vggt if method == 'A' else run_colmap_openmvs
-                        model = runner(images, run_dir / method, tools, emit, stage, check)
+                        if method == 'A':
+                            def review_vggt(preview_path):
+                                request = {'type': 'vggt_preview', 'path': str(preview_path),
+                                           'decision': threading.Event(), 'percentile': None,
+                                           'cancelled': False}
+                                report(request)
+                                while not request['decision'].wait(.1):
+                                    check()
+                                check()
+                                if request['cancelled']:
+                                    raise Cancelled('已取消 VGGT 预览；模型尚未保存。')
+                                return request['percentile']
+                            model = run_vggt(images, run_dir / method, tools, emit, stage, check,
+                                             preview_callback=review_vggt)
+                        else:
+                            model = runner(images, run_dir / method, tools, emit, stage, check)
                         record = {'status': 'success', 'model': str(model), 'evaluation_status': 'disabled'}
                         manifest['results'][method] = record
                         save_json(manifest_path, manifest)
