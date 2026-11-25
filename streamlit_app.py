@@ -21,6 +21,51 @@ from glacier.preprocessing import PreprocessConfig, preprocess, read_rgb, write_
 
 st.set_page_config(page_title="冰川三维重建工作台", page_icon="🏔️", layout="wide")
 
+wallpaper_path = Path(__file__).resolve().parent / "assets" / "snow-peaks-wallpaper.jpg"
+wallpaper_css = ""
+if wallpaper_path.is_file():
+    import base64
+    wallpaper_data = base64.b64encode(wallpaper_path.read_bytes()).decode("ascii")
+    wallpaper_css = f"background-image: linear-gradient(110deg, rgba(5, 10, 18, .91), rgba(7, 15, 26, .77)), url(data:image/jpeg;base64,{wallpaper_data});"
+
+st.markdown(f"""
+<style>
+:root {{ color-scheme: dark; }}
+.stApp {{ {wallpaper_css} background-color:#05080e; background-size:cover; background-attachment:fixed; background-position:center; color:#f1f6fc; }}
+[data-testid="stHeader"] {{ background:rgba(5,8,14,.62); }}
+.block-container {{ max-width:1480px; padding-top:2.1rem; padding-bottom:4rem; }}
+[data-testid="stSidebar"] {{ background:linear-gradient(180deg,rgba(7,13,23,.96),rgba(10,18,29,.88)); border-right:1px solid rgba(218,235,250,.12); }}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {{ color:#aebdcb; }}
+h1,h2,h3 {{ color:#f5f9fd !important; letter-spacing:-.025em; }}
+h1 {{ font-size:2.35rem !important; font-weight:750 !important; }}
+h2 {{ font-size:1.45rem !important; margin-top:1.8rem !important; }}
+[data-testid="stCaptionContainer"] {{ color:#9aabba; }}
+[data-testid="stAlert"] {{ background:rgba(18,29,43,.76); border:1px solid rgba(174,199,217,.24); border-radius:14px; color:#dce8f2; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ background:rgba(12,20,31,.67); border:1px solid rgba(220,237,250,.14); border-radius:18px; backdrop-filter:blur(14px); }}
+[data-testid="stFileUploader"] section {{ background:rgba(13,20,32,.62); border:1px dashed rgba(174,199,217,.45); border-radius:16px; }}
+[data-testid="stFileUploader"] section:hover {{ border-color:#aec7d9; }}
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {{ min-height:2.7rem; color:#f4f8fc; background:linear-gradient(135deg,rgba(39,60,82,.9),rgba(20,32,48,.94)); border:1px solid rgba(174,199,217,.44); border-radius:999px; padding:0 1.4rem; transition:all .18s ease; }}
+[data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover {{ border-color:#d3e4f1; background:rgba(54,76,99,.95); transform:translateY(-1px); }}
+[data-testid="stBaseButton-primary"] {{ background:linear-gradient(135deg,#c8ddea,#8eafc5) !important; color:#101a24 !important; border:0 !important; font-weight:750 !important; }}
+[data-testid="stBaseButton-primary"] p {{ color:#101a24 !important; }}
+input, textarea, [data-baseweb="select"] > div {{ background-color:rgba(13,20,32,.88) !important; border-color:rgba(130,151,171,.4) !important; border-radius:10px !important; color:#f1f6fc !important; }}
+[data-testid="stExpander"] {{ background:rgba(12,20,31,.56); border:1px solid rgba(220,237,250,.13); border-radius:14px; }}
+[data-testid="stMetric"] {{ background:rgba(17,27,40,.64); border:1px solid rgba(220,237,250,.13); padding:14px 16px; border-radius:14px; }}
+[data-testid="stPlotlyChart"] {{ background:rgba(10,16,25,.75); border:1px solid rgba(220,237,250,.13); border-radius:18px; padding:8px; }}
+hr {{ border-color:rgba(220,237,250,.13); }}
+@media (max-width: 760px) {{ .block-container {{ padding:1.2rem 1rem 3rem; }} h1 {{ font-size:1.8rem !important; }} }}
+</style>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown("# 🏔️ 冰川重建")
+    st.caption("GLACIER RECONSTRUCTION STUDIO")
+    st.markdown("---")
+    st.markdown("**工作流程**")
+    st.markdown("影像导入　·　预处理　·　重建　·　模型预览")
+    st.markdown("---")
+    st.caption("网页演示版")
+
 st.title("冰川三维重建工作台")
 st.caption("网页演示版 · 照片预处理、可用重建路径检测与三维模型预览")
 st.info(
