@@ -1,6 +1,6 @@
 # 冰川三维重建工作台
 
-一个用于冰川影像重建实验的 Windows 桌面工具。它负责整理输入照片、执行预处理、调用外部重建程序、查看模型并提交模型评价；VGGT、COLMAP 和 OpenMVS 本身需要另行安装和配置。
+一个用于冰川影像重建实验的项目，包含 Windows 桌面工作台和 Streamlit 网页演示版。两种界面共享影像预处理和重建调度代码；VGGT、COLMAP 和 OpenMVS 本身需要另行安装和配置。
 
 ## 功能
 
@@ -16,7 +16,7 @@
 ## 环境要求
 
 - Windows 10/11，Python 3.11 或更高版本。
-- 桌面程序依赖见 [`requirements.txt`](requirements.txt)。
+- 网页依赖见 [`requirements.txt`](requirements.txt)；桌面依赖见 [`requirements-desktop.txt`](requirements-desktop.txt)。
 - 重建路径还需要独立安装相应的 VGGT、COLMAP 和/或 OpenMVS，以及可用的显卡驱动、CUDA 和模型权重（取决于所选方法）。这些工具不由本项目自动下载或安装。
 
 ## 安装与启动
@@ -26,7 +26,7 @@
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
 .venv\Scripts\python.exe main.py
 ```
 
@@ -35,6 +35,20 @@ py -3.11 -m venv .venv
 ```powershell
 .venv\Scripts\python.exe launch.py --check
 ```
+
+## 网页版（Streamlit）
+
+网页入口是项目根目录的 `streamlit_app.py`。本地运行网页：
+
+```powershell
+py -3.11 -m venv .venv-web
+.venv-web\Scripts\python.exe -m pip install -r requirements.txt
+.venv-web\Scripts\python.exe -m streamlit run streamlit_app.py
+```
+
+网页支持照片上传、预处理参数调节、处理结果下载，以及 OBJ/PLY 三维预览。它会检测当前服务器是否已配置重建工具；只有 VGGT 或 COLMAP + OpenMVS 工具链实际可用时，才允许启动对应重建。可通过服务器环境变量提供工具路径（例如 `COLMAP_BIN`、`OPENMVS_BIN`、`VGGT_PYTHON`、`VGGT_REPO`）。
+
+Streamlit Community Cloud 使用根目录 `requirements.txt` 安装网页 Python 依赖。当前网页功能不需要额外 Linux 系统包，因此不提供 `packages.txt`。Community Cloud 默认环境不包含本项目所需的 VGGT、COLMAP、OpenMVS、模型权重或 GPU；网页界面可以部署，但要在云端完成实际重建，还需单独准备并验证 Linux 重建后端。不要把 API 密钥或私人凭证写入仓库；托管服务如需密钥，应使用其 Secret 管理功能。
 
 ## 配置重建工具
 
@@ -93,6 +107,8 @@ glacier_demo/
 ├── logs/               # 本机启动日志（运行时生成，不纳入 Git）
 ├── main.py             # 桌面应用入口
 ├── launch.py           # 启动与依赖检查入口
-├── requirements.txt    # 桌面版 Python 依赖
+├── requirements.txt    # Streamlit 网页版 Python 依赖
+├── requirements-desktop.txt # Windows 桌面版 Python 依赖
+├── streamlit_app.py    # Streamlit 网页入口
 └── README.md
 ```
