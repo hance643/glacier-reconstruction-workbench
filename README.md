@@ -25,6 +25,10 @@
 
 工具路径在检测/手动选定后会记入 glacier_demo/.local/tool_paths.json，启动时只恢复仍然有效的路径。保存配置仍可用于备份工具路径、附加参数和预处理设置；API 密钥不会写入配置文件。VGGT Python 指向能运行 VGGT 的解释器，仓库目录必须含 demo_colmap.py；COLMAP 选择 colmap.exe 或 PATH 中的 colmap；OpenMVS bin 目录应包含 InterfaceCOLMAP、DensifyPointCloud、ReconstructMesh、RefineMesh 和 TextureMesh。
 
+程序会在 glacier_demo/.local/session.json 自动保存最近使用的照片列表、结果目录和模型路径。重启后会尝试恢复照片、模型预览及任务目录；原照片已移动或删除时，会使用任务目录中保留的预处理图像。API 密钥不会写入此恢复文件。
+
+清空照片列表后，下一次重建成功时会自动删除上一个任务目录以释放磁盘空间；新任务失败时会保留旧目录和模型。
+
 附加参数使用 JSON 数组或对象。程序保留并管理输入、输出和工作目录参数，避免附加参数把结果写到用户未选择的路径。
 
 ## 任务目录
@@ -33,8 +37,10 @@
 
 ## 评价 API 约定
 
-程序发送 POST multipart/form-data：模型字段是 model.zip（包含 OBJ/PLY、同目录 MTL 和相对路径贴图），metadata 字段是 JSON 字符串。密钥通过配置鉴权头发送，默认 Authorization: Bearer <key>；密钥不会写入配置 JSON、manifest 或日志。响应应为 JSON 对象；界面直接展示 score、metrics、text/evaluation/summary/message 等后端字段，不自行推断评分。
+DeepSeek 地址（如 `https://api.deepseek.com`）使用 DeepSeek Vision 的 Chat Completions 接口，自动发送模型斜视/侧视/俯视预览图、顶点/面数量和包围盒，并依据内置的竞赛原型展示100分评分表返回逐项证据、总分、问题与建议。所有进入评价的模型均计90分基础展示分，另按主体呈现、三维视觉质量和流程完成度给予最多10分加分；这属于竞赛展示鼓励分，不代表地理坐标或测绘精度已经验证。该模式要求填写 DeepSeek API Key，使用 `deepseek-flash`。模型图片和几何信息会发送到配置的 DeepSeek 服务。
+
+其他自建评价地址仍使用 POST multipart/form-data：模型字段是 model.zip（包含 OBJ/PLY、同目录 MTL 和相对路径贴图），metadata 字段是 JSON 字符串。密钥通过配置鉴权头发送，默认 Authorization: Bearer <key>；密钥不会写入配置 JSON、manifest 或日志。响应应为 JSON 对象；界面直接展示后端返回内容。
 
 ## 已验证
 
-python -m compileall -q glacier_demo/glacier glacier_demo/main.py 通过；虚拟环境已成功安装 PySide6、VTK、OpenCV、Requests Toolbelt 和 psutil，并通过 Qt/VTK/UI 导入检查。未在本机运行真实 GPU VGGT、COLMAP/OpenMVS 或用户 API，因此实际算法效果与 API 字段需在目标环境联调。
+`python -m compileall -q glacier main.py`、`python launch.py --check`、DeepSeek 请求/评分逻辑模拟测试通过；VTK 已成功生成三张模型预览图。未使用真实 API Key 发起在线请求，首次真实评价仍需在界面填写 Key 并联调。

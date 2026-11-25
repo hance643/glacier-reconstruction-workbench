@@ -2,10 +2,12 @@
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
+import re
+import shutil
 
 import math
 from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRect, QRectF
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QRegion,
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QRegion,
                             QPen, QRadialGradient, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
@@ -358,8 +360,8 @@ class GlassTabBar(QTabBar):
             rect = QRectF(self.tabRect(index)).adjusted(2, 2, -2, -2)
             selected = index == self.currentIndex()
             if selected:
-                fill = QColor(77, 107, 254, 82)
-                edge = QColor(137, 169, 255, 225)
+                fill = QColor(22, 143, 234, 100)
+                edge = QColor(102, 190, 255, 235)
                 text = QColor(255, 255, 255, 255)
             elif self.tabAt(self.mapFromGlobal(self.cursor().pos())) == index and self.underMouse():
                 fill = QColor(190, 218, 242, 58)
@@ -423,16 +425,23 @@ class EvaluationPanel(QWidget):
         result = payload['result']
         # 没有 score 字段时如实标注，不计算或猜测一个评分。
         score = result.get('score', '后端未提供 score')
-        self.score.setText('评分：' + str(score))
+        self.score.setText('评分：' + str(score) + (' / 100' if isinstance(score, (int, float)) else ''))
         self.score.setTextFormat(Qt.TextFormat.PlainText)
         metrics = result.get('metrics', {})
-        if not isinstance(metrics, dict):
-            metrics = {'metrics': metrics}
-        self.metrics.setRowCount(len(metrics))
-        for row, (key, value) in enumerate(metrics.items()):
-            self.metrics.setItem(row, 0, QTableWidgetItem(str(key)))
-            self.metrics.setItem(row, 1, QTableWidgetItem(
-                json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)))
+        if isinstance(metrics, list):
+            self.metrics.setRowCount(len(metrics))
+            for row, item in enumerate(metrics):
+                self.metrics.setItem(row, 0, QTableWidgetItem(str(item.get('name', '未命名指标'))))
+                value = f"{item.get('score', '?')} / {item.get('max_score', '?')} · {item.get('evidence', '')}"
+                self.metrics.setItem(row, 1, QTableWidgetItem(value))
+        else:
+            if not isinstance(metrics, dict):
+                metrics = {'metrics': metrics}
+            self.metrics.setRowCount(len(metrics))
+            for row, (key, value) in enumerate(metrics.items()):
+                self.metrics.setItem(row, 0, QTableWidgetItem(str(key)))
+                self.metrics.setItem(row, 1, QTableWidgetItem(
+                    json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)))
         text = result.get('text', result.get('evaluation', result.get('summary', result.get('message', ''))))
         self.text.setPlainText(text if isinstance(text, str) else json.dumps(text, ensure_ascii=False, indent=2))
         self.raw.setPlainText(json.dumps(payload['raw'], ensure_ascii=False, indent=2))
@@ -442,10 +451,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('冰川三维重建 · Glacier Reconstruction Studio')
-        # Open at a more compact size while allowing the user to shrink the
-        # workstation substantially on smaller screens.
-        self.resize(1100, 700)
-        self.setMinimumSize(820, 560)
+        icon_path = Path(__file__).resolve().parent.parent / 'assets' / 'glacier_icon.ico'
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        # Keep the workstation compact; each results column has its own
+        # scrollbar for the model details and API evaluation below the preview.
+        self.resize(1100, 760)
+        self.setMinimumSize(820, 620)
         self.setAcceptDrops(True)
         self.workers = set()       # 保持强引用，防止运行中的 QThread 被析构
         self.job = None
@@ -453,6 +465,8 @@ class MainWindow(QMainWindow):
         self.preview_revision = 0
         self.models = {}
         self.evaluations = {}
+        self.last_run = None
+        self.pending_cleanup_run = None
         self.closing = False
         self._build()
         # 窗口先显示，再在工作线程恢复/发现工具，避免遍历安装目录卡住 GUI。
@@ -465,23 +479,133 @@ class MainWindow(QMainWindow):
         self.restore_tool_paths()
         for field in self.tool_path_fields().values():
             field.editingFinished.connect(self.cache_tool_paths)
+        self.restore_session()
+
+    def session_file(self):
+        return Path(__file__).resolve().parents[1] / '.local' / 'session.json'
+
+    def save_session(self):
+        """Persist resumable UI state without API credentials or machine secrets."""
+        try:
+            save_json(self.session_file(), {
+                'version': 1,
+                'output': self.output.text().strip(),
+                'images': [str(path) for path in self.drop.paths()],
+                'last_run': self.last_run,
+                'models': self.models,
+                'evaluations': self.evaluations,
+                'pending_cleanup_run': self.pending_cleanup_run,
+            })
+        except (OSError, TypeError, ValueError) as exc:
+            self.statusBar().showMessage(f'无法保存恢复状态：{exc}')
+
+    def restore_session(self):
+        """Restore the last photo list and task results when the app reopens."""
+        session_path = self.session_file()
+        try:
+            state = json.loads(session_path.read_text(encoding='utf-8')) if session_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            state = {}
+
+        saved_output = state.get('output')
+        if saved_output:
+            self.output.setText(str(saved_output))
+        self.last_run = state.get('last_run')
+        self.pending_cleanup_run = state.get('pending_cleanup_run')
+        if not self.last_run:
+            try:
+                manifests = Path(self.output.text()).expanduser().glob('run_*/manifest.json')
+                latest = max(manifests, key=lambda path: path.stat().st_mtime, default=None)
+                if latest:
+                    self.last_run = str(latest.parent)
+            except OSError:
+                pass
+
+        # Existing sessions restore original inputs when available. If those
+        # files moved, use the processed copies retained in the task folder.
+        has_saved_image_list = isinstance(state.get('images'), list)
+        image_paths = state.get('images', []) if has_saved_image_list else []
+        run_path = Path(self.last_run) if self.last_run else None
+        manifest_path = run_path / 'manifest.json' if run_path else None
+        manifest = {}
+        if manifest_path and manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+        if not has_saved_image_list and manifest:
+            for item in manifest.get('input_images', []):
+                source = Path(item.get('source', ''))
+                processed = run_path / 'images' / item.get('processed', '')
+                image_paths.append(str(source if source.is_file() else processed))
+        restored = []
+        for raw_path in image_paths:
+            path = Path(raw_path)
+            if path.is_file():
+                self.drop.addItem(str(path))
+                restored.append(path)
+        if manifest:
+            restored_paths = {str(path.resolve()).casefold() for path in restored}
+            for item in manifest.get('input_images', []):
+                source = Path(item.get('source', ''))
+                processed = run_path / 'images' / item.get('processed', '')
+                processed_key = str(processed.resolve()).casefold()
+                source_was_saved = str(source) in image_paths
+                if (not source.is_file() and processed.is_file() and processed_key not in restored_paths
+                        and (not has_saved_image_list or source_was_saved)):
+                    self.drop.addItem(str(processed))
+                    restored.append(processed)
+                    restored_paths.add(processed_key)
+        self.count_label.setText(f'{len(restored)} 张')
+        if restored:
+            self.drop.setCurrentRow(0)
+            self.queue_preview()
+
+        if run_path and run_path.is_dir():
+            self.run_path.setText('任务输出：' + str(run_path))
+        model_paths = dict(state.get('models', {}))
+        saved_evaluations = state.get('evaluations', {})
+        if manifest:
+            for method, result in manifest.get('results', {}).items():
+                model_paths.setdefault(method, result.get('model'))
+        for method in ('A', 'B'):
+            raw_path = model_paths.get(method)
+            if raw_path and Path(raw_path).is_file():
+                self.models[method] = str(raw_path)
+                try:
+                    self.viewers[method].load_model(raw_path)
+                except Exception as exc:
+                    self.log.appendPlainText(f'恢复路径 {method} 模型预览失败：{exc} · {raw_path}')
+                if isinstance(saved_evaluations.get(method), dict):
+                    data = saved_evaluations[method]
+                    self.evaluations[method] = data
+                    self.eval_panels[method].display(data)
+                else:
+                    evaluation_path = (run_path / method / 'evaluation.json') if run_path else None
+                    if evaluation_path and evaluation_path.is_file():
+                        try:
+                            data = json.loads(evaluation_path.read_text(encoding='utf-8'))
+                            self.evaluations[method] = data
+                            self.eval_panels[method].display(data)
+                        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                            pass
+        if self.models:
+            self.tabs.setCurrentIndex(1)
+        if self.last_run or restored or self.models:
+            self.statusBar().showMessage('已恢复上次照片列表和任务结果；新建任务后将更新恢复记录。')
 
     def _build(self):
         root = AtmosphereWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(22, 16, 22, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(22, 8, 22, 8)
+        layout.setSpacing(6)
         brand = QLabel("Let's START")
         brand.setObjectName('eyebrow')
         layout.addWidget(brand)
         self.title_label = QLabel('冰川三维重建工作台')
         self.title_label.setObjectName('appTitle')
         layout.addWidget(self.title_label)
-        subtitle = QLabel('图像导入 → 冰雪影像预处理 → 双路径重建 → 模型对比与 API 评价')
-        subtitle.setObjectName('subtitle')
-        root.setToolTip(subtitle.text())
-        subtitle.hide()
         header_rule = QWidget()
         header_rule.setFixedHeight(1)
         header_rule.setStyleSheet('background: rgba(255,255,255,34);')
@@ -525,6 +649,7 @@ class MainWindow(QMainWindow):
         self.run_button.setObjectName('primaryButton')
         self.run_button.clicked.connect(self.start)
         self.cancel_button = QPushButton('取消任务')
+        self.cancel_button.setObjectName('primaryButton')
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel)
         self.progress = QProgressBar()
@@ -557,7 +682,6 @@ class MainWindow(QMainWindow):
             widget.setRange(low, high)
             widget.setSingleStep(step)
             widget.setValue(default)
-            widget.setToolTip(tip)
             widget.valueChanged.connect(self.queue_preview)
             self.prep_widgets[name] = widget
             form.addRow(label, widget)
@@ -571,7 +695,6 @@ class MainWindow(QMainWindow):
         form.addRow('输出最长边 / px', edge)
         reset = QPushButton('恢复保守默认参数')
         reset.clicked.connect(self.reset_preprocessing)
-        reset.setToolTip('实时预览为缩略图近似效果；实际任务使用统一参数，不修改原片；无法凭空补回真实纹理。')
         form.addRow(reset)
         layout.addWidget(box)
 
@@ -579,11 +702,14 @@ class MainWindow(QMainWindow):
         field = QLineEdit(initial)
         field.setObjectName('pathField')
         field.setMinimumWidth(0)
+        # 路径通常会被输入框宽度截断；悬停时展示当前完整值，且
+        # 随用户输入、浏览选择或配置加载而同步更新。
+        field.setToolTip(field.text())
+        field.textChanged.connect(field.setToolTip)
         button = QPushButton('浏览')
         button.setObjectName('browseButton')
         button.setFixedWidth(44)
         button.setFixedHeight(30)
-        button.setToolTip('选择文件或文件夹')
         def choose():
             if mode == 'dir':
                 value = QFileDialog.getExistingDirectory(self, label, field.text())
@@ -613,10 +739,8 @@ class MainWindow(QMainWindow):
         self.path_b = QCheckBox('路径 B · COLMAP + OpenMVS')
         # The full label is useful, but at compact window widths its natural
         # one-line size can force the entire scroll area wider than the rail.
-        self.path_b.setToolTip('路径 B：COLMAP + OpenMVS 传统多视图立体重建')
         form.addRow(self.path_a)
         form.addRow(self.path_b)
-        box.setToolTip('同时选中时顺序运行，复用同一批预处理图像。')
         self.output = self._path_field(form, '结果保存目录', 'dir', str(Path(__file__).resolve().parents[1] / 'outputs'))
         self.vggt_python = self._path_field(form, 'VGGT Python', 'file')
         self.vggt_repo = self._path_field(form, 'VGGT 仓库目录', 'dir')
@@ -628,7 +752,6 @@ class MainWindow(QMainWindow):
         self.colmap_extra = QLineEdit('{}')
         self.openmvs_extra = QLineEdit('{}')
         for label, field in [('COLMAP 阶段参数', self.colmap_extra), ('OpenMVS 阶段参数', self.openmvs_extra)]:
-            field.setToolTip('JSON 对象：阶段名 → 字符串参数数组。具体选项参见安装工具的 --help。')
             form.addRow(label, field)
         row = QHBoxLayout()
         save = QPushButton('保存配置')
@@ -647,7 +770,6 @@ class MainWindow(QMainWindow):
         detect_row.addWidget(scan)
         form.addRow(detect_row)
         self.candidates_button = QPushButton('选择工具版本')
-        self.candidates_button.setToolTip('选择自动检测到的工具路径和版本')
         self.candidates_button.setEnabled(False)
         self.candidates_button.clicked.connect(self.choose_detected_tools)
         form.addRow(self.candidates_button)
@@ -671,7 +793,9 @@ class MainWindow(QMainWindow):
         self.api_enabled = QCheckBox('每条路径完成后自动上传并评价')
         form.addRow(self.api_enabled)
         self.api_url = QLineEdit()
-        self.api_url.setPlaceholderText('https://your-server.example/evaluate')
+        self.api_url.setPlaceholderText('https://api.deepseek.com 或自建评价接口完整地址')
+        self.api_url.setToolTip(self.api_url.text())
+        self.api_url.textChanged.connect(self.api_url.setToolTip)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.auth_header = QLineEdit('Authorization')
@@ -689,7 +813,6 @@ class MainWindow(QMainWindow):
                              ('文件字段', self.file_field), ('元数据字段', self.meta_field),
                              ('响应结果根路径', self.result_path), ('响应读取超时', self.timeout)]:
             form.addRow(label, field)
-        box.setToolTip('POST multipart：上传模型 ZIP（模型、MTL、同目录/子目录贴图）与 metadata JSON。评分及指标由后端返回；启用即允许向该地址上传。')
         layout.addWidget(box)
 
     def _input_page(self):
@@ -717,7 +840,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.drop, 1)
         self.preview_note = QLabel('选择一张图像，调整左侧参数即可更新预览')
         self.preview_note.setWordWrap(True)
-        self.drop.setToolTip(self.preview_note.text())
         self.preview_note.hide()
         pair = QHBoxLayout()
         self.original_preview = self._preview_label('原图')
@@ -738,25 +860,44 @@ class MainWindow(QMainWindow):
     def _results_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel('并排检查两条路径的模型与后端指标。两种重建的坐标系/尺度可能不同；此页面不执行几何对齐。')
-        page.setToolTip(note.text())
-        note.hide()
+        # Each algorithm gets its own vertical scroll area so its model canvas,
+        # footer text and API evaluation move together independently.
         split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
         self.viewers, self.eval_panels = {}, {}
         for method, name in [('A', '路径 A · VGGT'), ('B', '路径 B · COLMAP + OpenMVS')]:
-            column = QWidget()
-            col = QVBoxLayout(column)
-            viewer = ModelViewer(name)
+            content = QWidget()
+            content.setMinimumHeight(800)
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(2, 2, 2, 8)
+            viewer = ModelViewer(name, vggt_controls=(method == 'A'))
             viewer.load_requested.connect(lambda m=method: self.load_model(m))
             viewer.evaluate_requested.connect(lambda m=method: self.evaluate_model(m))
             self.viewers[method] = viewer
-            self.eval_panels[method] = EvaluationPanel()
-            vertical = QSplitter(Qt.Orientation.Vertical)
-            vertical.addWidget(viewer)
-            vertical.addWidget(self.eval_panels[method])
-            vertical.setSizes([480, 260])
-            col.addWidget(vertical)
-            split.addWidget(column)
+            evaluation = EvaluationPanel()
+            self.eval_panels[method] = evaluation
+            # Evaluation details can be long; scroll them inside their own
+            # pane so they never take space from the model preview or footer.
+            evaluation_scroll = QScrollArea()
+            evaluation_scroll.setWidgetResizable(True)
+            evaluation_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            evaluation_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            evaluation_scroll.setWidget(evaluation)
+            content_layout.addWidget(viewer, 0)
+            content_layout.addWidget(evaluation_scroll, 1)
+            side_scroll = QScrollArea()
+            side_scroll.setObjectName('resultsScroll')
+            side_scroll.setWidgetResizable(True)
+            side_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # Keep each scrollbar available and independently draggable.
+            side_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+            viewer.scroll_area = side_scroll
+            side_scroll.setWidget(content)
+            split.addWidget(side_scroll)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        split.setSizes([1, 1])
         layout.addWidget(split, 1)
         self.tabs.addTab(page, '② 模型与评价对比')
 
@@ -769,7 +910,6 @@ class MainWindow(QMainWindow):
         self.run_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.run_path)
         note = QLabel('进度按已完成阶段估算；单个 GPU 步骤可能长时间停留。完整日志及 manifest.json 保存在独立任务目录。')
-        page.setToolTip(note.text())
         note.hide()
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -818,6 +958,7 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f'{self.drop.count()} 张')
         if self.drop.currentRow() < 0 and self.drop.count():
             self.drop.setCurrentRow(0)
+        self.save_session()
         self.statusBar().showMessage(f'已加载 {self.drop.count()} 张图像；损坏文件会在预览或任务中报告。')
 
     def remove_selected(self):
@@ -827,15 +968,21 @@ class MainWindow(QMainWindow):
             self.drop.takeItem(self.drop.row(item))
         self.count_label.setText(f'{self.drop.count()} 张')
         self.queue_preview()
+        self.save_session()
 
     def clear_images(self):
         if self.job:
             return
+        if self.last_run and not self.pending_cleanup_run:
+            self.pending_cleanup_run = self.last_run
         self.drop.clear()
         self.count_label.setText('0 张')
         self.original_preview.setText('原图')
         self.processed_preview.setText('预处理预览')
         self.queue_preview()
+        self.save_session()
+        if self.pending_cleanup_run:
+            self.statusBar().showMessage('已清空导入照片；下次重建成功后将清理上一个任务目录。')
 
     def prep_config(self):
         return PreprocessConfig(**{k: w.value() for k, w in self.prep_widgets.items()})
@@ -1101,9 +1248,46 @@ class MainWindow(QMainWindow):
 
     def task_finished(self, result):
         manifest = result['manifest']
+        self.last_run = result['run_dir']
+        if manifest.get('status') in {'success', 'partial'} and self.pending_cleanup_run:
+            if self.cleanup_previous_run(result['run_dir']):
+                self.log.appendPlainText(f'已清理上一个任务目录：{self.pending_cleanup_run}')
+                self.pending_cleanup_run = None
+        self.save_session()
         self.log.appendPlainText('任务结束：' + manifest['status'] + ' · ' + result['run_dir'])
         if any(r['status'] == 'success' for r in manifest['results'].values()):
             self.tabs.setCurrentIndex(1)
+
+    def cleanup_previous_run(self, current_run):
+        """Remove only the prior app-created run, after a replacement succeeds."""
+        try:
+            old_candidate = Path(self.pending_cleanup_run).expanduser()
+            if not old_candidate.exists():
+                return True
+            old = old_candidate.resolve(strict=True)
+            current = Path(current_run).expanduser().resolve()
+            if (old == current or not re.fullmatch(r'run_\d{8}_\d{6}_[0-9a-f]{8}', old.name)
+                    or not (old / 'manifest.json').is_file()):
+                raise ValueError('旧任务目录校验失败，已保留未删除。')
+            manifest = json.loads((old / 'manifest.json').read_text(encoding='utf-8'))
+            if not isinstance(manifest, dict) or 'input_images' not in manifest or 'results' not in manifest:
+                raise ValueError('旧任务清单格式不符，已保留未删除。')
+            old_resolved = old
+            for method, model in list(self.models.items()):
+                try:
+                    model_path = Path(model).resolve()
+                    if model_path.is_relative_to(old_resolved):
+                        self.viewers[method].clear_model()
+                        self.eval_panels[method].reset('上一任务结果已清理')
+                        self.models.pop(method, None)
+                        self.evaluations.pop(method, None)
+                except (OSError, ValueError):
+                    continue
+            shutil.rmtree(old)
+            return True
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.log.appendPlainText(f'未能自动清理上一个任务目录：{exc}')
+            return False
 
     def cancel(self):
         if self.job:
@@ -1121,7 +1305,9 @@ class MainWindow(QMainWindow):
         if typ == 'log':
             self.log.appendPlainText(item['text'])
         elif typ == 'run':
+            self.last_run = item['path']
             self.run_path.setText('任务输出：' + item['path'])
+            self.save_session()
         elif typ == 'progress':
             value = item.get('value')
             self.progress.setRange(0, 0 if value is None else 100)
@@ -1158,6 +1344,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.log.appendPlainText(f'模型已保存，但显示失败：{exc} · {path}')
         self.viewers[method].eval_button.setEnabled(self.job is None)
+        self.save_session()
 
     def evaluate_model(self, method):
         if self.job or method not in self.models:
@@ -1175,6 +1362,7 @@ class MainWindow(QMainWindow):
         def done(payload):
             self.evaluations[method] = payload
             self.eval_panels[method].display(payload)
+            self.save_session()
             self.log.appendPlainText(f'路径 {method} 评价完成。')
         self.start_worker(call, done, error=lambda msg: self.evaluation_failed(method, msg))
 
@@ -1246,12 +1434,14 @@ QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }
 QSplitter::handle { background:transparent; }
 QGroupBox { font-size:18px; font-weight:900; border:0; border-radius:10px; margin-top:12px; padding:8px 2px 8px; background:transparent; }
 QGroupBox::title { subcontrol-origin:margin; left:32px; padding:0; color:#CEC8BB; font-family:'Noto Sans SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:18px; font-weight:900; }
-QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:rgb(13,20,32); border:1px solid rgb(72,86,104); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#4D6BFE; alternate-background-color:rgb(21,30,44); }
+QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:rgb(13,20,32); border:1px solid rgb(72,86,104); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#168FEA; alternate-background-color:rgb(21,30,44); }
 QLineEdit#pathField { font-size:11px; padding-left:5px; padding-right:5px; }
 QListWidget#glassDropList, QListWidget#glassDropList::viewport { background:transparent; border:0; }
-QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border:1px solid #4D6BFE; }
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border:1px solid #168FEA; }
 QListWidget::item { padding:7px 8px; border-radius:8px; }
 QListWidget::item:selected, QTableWidget::item:selected { background:rgb(45,67,112); color:#FFFFFF; }
+QLabel#viewerHint { color:rgba(235,244,252,220); padding:5px 2px 0; }
+QLabel#viewerStatus { color:rgba(205,218,232,180); font-size:12px; padding:0 2px 3px; }
 QHeaderView::section { background:rgb(24,33,48); color:#CEC8BB; border:0; padding:8px; }
 QPushButton { min-height:20px; background:rgb(17,24,38); color:#F1F6FC; border:1px solid rgb(94,108,126); border-radius:18px; padding:4px 12px; font-size:12px; }
 QPushButton#imageActionButton { background:transparent; border:0; border-radius:0; padding:4px 16px; min-height:30px; color:#F5FAFF; }
@@ -1264,13 +1454,13 @@ QPushButton#primaryButton { background:rgb(24,32,48); color:#FFFFFF; border:1px 
 QPushButton#primaryButton:hover { background:rgb(40,52,73); border-color:rgb(180,194,208); }
 QTabWidget::pane { border:0; background:transparent; top:-1px; }
 QTabWidget#glassTabs::pane { border:0; background:transparent; }
-QScrollArea#glassRail { border:0; background:transparent; }
+QScrollArea#glassRail, QScrollArea#resultsScroll { border:0; background:transparent; }
 QTabBar::tab { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:16px; font-weight:800; color:transparent; background:transparent; border:0; padding:8px 18px; margin:2px; }
 QProgressBar { border:1px solid rgb(94,108,126); border-radius:100px; text-align:center; min-height:16px; background:rgb(13,20,32); color:#FFFFFF; }
 QProgressBar::chunk { background:#AEC7D9; border-radius:100px; }
 QCheckBox { spacing:10px; }
 QCheckBox::indicator { width:18px; height:18px; border-radius:5px; border:1px solid rgb(120,136,154); background:rgb(13,20,32); }
-QCheckBox::indicator:checked { background:#4D6BFE; border-color:#4D6BFE; }
+QCheckBox::indicator:checked { background:#168FEA; border-color:#168FEA; }
 QScrollBar:vertical { background:transparent; width:10px; margin:4px; }
 QScrollBar::handle:vertical { background:rgba(255,255,255,60); border-radius:5px; min-height:28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }

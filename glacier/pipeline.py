@@ -239,14 +239,17 @@ def run_colmap_openmvs(images, output_dir, cfg, emit, stage, check_cancel):
     emit(f'采用最大连通模型 {selected.name}，注册图像 {registered_count(selected)} 张。')
     step('图像去畸变', [colmap, 'image_undistorter', '--image_path', images, '--input_path', selected,
                        '--output_path', dense, '--output_type', 'COLMAP', *ce.get('image_undistorter', [])])
-    scene, dense_scene, mesh, refined = [output_dir / name for name in
-                                       ['scene.mvs', 'scene_dense.mvs', 'scene_mesh.mvs', 'scene_refined.mvs']]
+    scene, dense_scene = [output_dir / name for name in ['scene.mvs', 'scene_dense.mvs']]
+    # ReconstructMesh emits a mesh (PLY), while the MVS scene carries cameras
+    # and image metadata needed by RefineMesh and TextureMesh.
+    mesh = output_dir / 'scene_mesh.ply'
+    refined = output_dir / 'scene_mesh_refined.ply'
     commands = [
         ('InterfaceCOLMAP', ['-i', dense, '-o', scene]),
         ('DensifyPointCloud', ['-i', scene, '-o', dense_scene]),
         ('ReconstructMesh', ['-i', dense_scene, '-o', mesh]),
-        ('RefineMesh', ['-i', mesh, '-o', refined]),
-        ('TextureMesh', ['-i', refined, '-o', model_dir / 'glacier.mvs', '--export-type', 'obj']),
+        ('RefineMesh', ['-i', dense_scene, '-m', mesh, '-o', refined]),
+        ('TextureMesh', ['-i', dense_scene, '-m', refined, '-o', model_dir / 'glacier.mvs', '--export-type', 'obj']),
     ]
     for name, args in commands:
         step(name, [mvs_executable(cfg, name), *args, *me.get(name, [])])
