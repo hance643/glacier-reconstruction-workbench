@@ -4,14 +4,14 @@ import json
 from pathlib import Path
 
 import math
-from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRect, QRectF, QObject, QEvent
+from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRect, QRectF
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QRegion,
                             QPen, QRadialGradient, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QInputDialog,
-    QSpinBox, QStyle, QStyleOptionGroupBox, QTabWidget, QTableWidget,
+    QSpinBox, QStyle, QStyleOptionGroupBox, QTabBar, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .evaluation import APIConfig, evaluate, validate_api
@@ -21,20 +21,6 @@ from .preprocessing import PreprocessConfig, collect_images, preprocess, read_rg
 from .tasks import reconstruction_task, save_json
 from .viewer import ModelViewer
 from .workers import Worker
-
-
-class CapsuleStyle(QObject):
-    """Qt does not clamp oversized QSS radii like CSS; fit the pill to its bounds.
-
-    This filter only adjusts painting style. Button signals and actions are untouched.
-    """
-    def eventFilter(self, watched, event):
-        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
-            radius = max(1, min(100, watched.height() // 2, watched.width() // 2))
-            style = f'border-radius:{radius}px;'
-            if watched.styleSheet() != style:
-                watched.setStyleSheet(style)
-        return super().eventFilter(watched, event)
 
 
 class DropList(QListWidget):
@@ -64,10 +50,33 @@ class DropList(QListWidget):
         return [Path(self.item(i).text()) for i in range(self.count())]
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        paint_frost(self, painter, QRectF(self.rect()))
-        painter.end()
+        # Keep the empty photo-drop area transparent so it blends into the
+        # surrounding landscape instead of becoming a large dark slab.
         super().paintEvent(event)
+
+
+class GlassPillButton(QPushButton):
+    """A photo-action button painted as a clean, truly elliptical glass slot."""
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(.75, .75, -.75, -.75)
+        if not self.isEnabled():
+            fill, edge, foreground = QColor(190, 218, 242, 15), QColor(230, 242, 255, 55), QColor(220, 232, 244, 125)
+        elif self.isDown():
+            fill, edge, foreground = QColor(130, 175, 220, 95), QColor(242, 249, 255, 205), QColor(255, 255, 255)
+        elif self.underMouse():
+            fill, edge, foreground = QColor(190, 218, 242, 72), QColor(242, 249, 255, 205), QColor(255, 255, 255)
+        else:
+            fill, edge, foreground = QColor(190, 218, 242, 34), QColor(230, 242, 255, 125), QColor(245, 250, 255)
+        radius = rect.height() / 2
+        painter.setPen(QPen(edge, 1.5))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, radius, radius)
+        painter.setPen(foreground)
+        painter.setFont(self.font())
+        painter.drawText(rect.adjusted(10, 0, -10, 0), Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
 
 
 class AtmosphereWidget(QWidget):
@@ -331,9 +340,48 @@ class FrostLabel(QLabel):
         super().paintEvent(event)
 
 
+class GlassTabBar(QTabBar):
+    """Paint each page tab as a rounded translucent glass slot."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setExpanding(False)
+        self.setUsesScrollButtons(False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = self.font()
+        font.setPixelSize(16)
+        font.setWeight(QFont.Weight.Bold)
+        painter.setFont(font)
+        for index in range(self.count()):
+            rect = QRectF(self.tabRect(index)).adjusted(2, 2, -2, -2)
+            selected = index == self.currentIndex()
+            if selected:
+                fill = QColor(77, 107, 254, 82)
+                edge = QColor(137, 169, 255, 225)
+                text = QColor(255, 255, 255, 255)
+            elif self.tabAt(self.mapFromGlobal(self.cursor().pos())) == index and self.underMouse():
+                fill = QColor(190, 218, 242, 58)
+                edge = QColor(238, 247, 255, 175)
+                text = QColor(235, 244, 252, 240)
+            else:
+                fill = QColor(190, 218, 242, 28)
+                edge = QColor(230, 242, 255, 105)
+                text = QColor(235, 244, 252, 220)
+            painter.setPen(QPen(edge, 1))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+            painter.setPen(text)
+            painter.drawText(rect.adjusted(8, 0, -8, 0),
+                             Qt.AlignmentFlag.AlignCenter, self.tabText(index))
+        painter.end()
+
+
 class FrostTabs(QTabWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.setTabBar(GlassTabBar())
         self.setProperty('frostSurface', True)
 
     def paintEvent(self, event):
@@ -488,9 +536,6 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.progress, 1)
         footer.addWidget(self.stage_label)
         layout.addLayout(footer)
-        self._capsule_style = CapsuleStyle(self)
-        for button in self.findChildren(QPushButton):
-            button.installEventFilter(self._capsule_style)
         self.statusBar().showMessage('可拖入单张/多张照片或文件夹；重建需要至少两张重叠影像。')
 
     def _preprocess_panel(self, layout):
@@ -656,7 +701,8 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         for text, callback in [('选择图片', self.choose_files), ('选择文件夹', self.choose_folder),
                                ('移除选中', self.remove_selected), ('清空列表', self.clear_images)]:
-            button = QPushButton(text)
+            button = GlassPillButton(text)
+            button.setObjectName('imageActionButton')
             button.clicked.connect(callback)
             row.addWidget(button)
         self.count_label = QLabel('0 张')
@@ -1202,13 +1248,14 @@ QGroupBox { font-size:18px; font-weight:900; border:0; border-radius:10px; margi
 QGroupBox::title { subcontrol-origin:margin; left:32px; padding:0; color:#CEC8BB; font-family:'Noto Sans SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:18px; font-weight:900; }
 QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:rgb(13,20,32); border:1px solid rgb(72,86,104); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#4D6BFE; alternate-background-color:rgb(21,30,44); }
 QLineEdit#pathField { font-size:11px; padding-left:5px; padding-right:5px; }
-QListWidget#glassDropList { background:rgb(13,20,32); border:1px solid rgb(72,86,104); }
+QListWidget#glassDropList, QListWidget#glassDropList::viewport { background:transparent; border:0; }
 QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border:1px solid #4D6BFE; }
 QListWidget::item { padding:7px 8px; border-radius:8px; }
 QListWidget::item:selected, QTableWidget::item:selected { background:rgb(45,67,112); color:#FFFFFF; }
 QHeaderView::section { background:rgb(24,33,48); color:#CEC8BB; border:0; padding:8px; }
-QPushButton { min-height:20px; background:rgb(17,24,38); color:#F1F6FC; border:1px solid rgb(94,108,126); border-radius:100px; padding:4px 12px; font-size:12px; }
-QPushButton#browseButton { min-height:24px; padding:2px 4px; font-size:12px; border-radius:100px; background:rgb(17,24,38); border:1px solid rgb(94,108,126); }
+QPushButton { min-height:20px; background:rgb(17,24,38); color:#F1F6FC; border:1px solid rgb(94,108,126); border-radius:18px; padding:4px 12px; font-size:12px; }
+QPushButton#imageActionButton { background:transparent; border:0; border-radius:0; padding:4px 16px; min-height:30px; color:#F5FAFF; }
+QPushButton#browseButton { min-height:24px; padding:2px 4px; font-size:12px; border-radius:15px; background:rgb(17,24,38); border:1px solid rgb(94,108,126); }
 QPushButton#browseButton:hover { background:rgb(30,42,60); border-color:rgb(150,168,188); }
 QPushButton:hover { background:rgb(30,42,60); border-color:rgb(150,168,188); }
 QPushButton:pressed { background:rgb(38,48,63); }
@@ -1218,8 +1265,7 @@ QPushButton#primaryButton:hover { background:rgb(40,52,73); border-color:rgb(180
 QTabWidget::pane { border:0; background:transparent; top:-1px; }
 QTabWidget#glassTabs::pane { border:0; background:transparent; }
 QScrollArea#glassRail { border:0; background:transparent; }
-QTabBar::tab { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:16px; font-weight:800; color:rgba(220,234,248,190); background:rgb(13,20,32); border:1px solid rgb(48,59,75); border-radius:100px; padding:6px 12px; margin:3px; }
-QTabBar::tab:selected { color:#FFFFFF; background:rgb(37,53,91); border-color:rgb(77,107,254); }
+QTabBar::tab { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:16px; font-weight:800; color:transparent; background:transparent; border:0; padding:8px 18px; margin:2px; }
 QProgressBar { border:1px solid rgb(94,108,126); border-radius:100px; text-align:center; min-height:16px; background:rgb(13,20,32); color:#FFFFFF; }
 QProgressBar::chunk { background:#AEC7D9; border-radius:100px; }
 QCheckBox { spacing:10px; }
