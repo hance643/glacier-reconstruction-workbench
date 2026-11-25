@@ -1,46 +1,95 @@
-# 冰川三维重建可视化演示
+# 冰川三维重建工作台
 
-这是一个上层调度 GUI：它不修改 VGGT、COLMAP 或 OpenMVS 的算法内核。程序负责读取照片、保留原始影像、生成统一的预处理副本、启动外部命令、保存独立任务目录、显示模型，并通过 HTTP 把模型压缩包送到用户自研评价 API。
+一个用于冰川影像重建实验的 Windows 桌面工具。它负责整理输入照片、执行预处理、调用外部重建程序、查看模型并提交模型评价；VGGT、COLMAP 和 OpenMVS 本身需要另行安装和配置。
 
-## 技术选型
+## 功能
 
-- Python 3.11+；PySide6 负责桌面 GUI、拖放、后台 QThread 和进度信号。
-- Pillow / OpenCV 负责中文路径图像读取和 Lab 亮度通道处理。预处理包括高光压缩、CLAHE 局部对比度、Gamma、双边降噪和可选锐化。
-- VTK 负责 OBJ/MTL/纹理和 PLY 顶点色显示；如果环境尚未安装 VTK，重建和评价仍可运行，但显示区只会提示模型路径。
-- subprocess + psutil 调用外部工具；每个阶段的 stdout/stderr 进入任务日志，取消时连同子进程树一起退出。
-- Requests Toolbelt 以 multipart 流式上传模型 ZIP，客户端不计算分数，只展示后端 JSON。
+- 导入多张照片，预览并调整高光压缩、局部对比度、Gamma、降噪和锐化。
+- 运行 VGGT（路径 A）或 COLMAP + OpenMVS（路径 B），查看任务进度和日志。
+- 浏览 OBJ/PLY 模型；VTK 可用于显示网格、纹理和点云颜色。
+- 可选调用 DeepSeek Vision 或自建 HTTP 评价服务。
+- 在本机记住工具路径、照片列表和最近结果，便于下次恢复。
 
-## 安装和运行
+## 环境要求
 
-已配置本机快捷方式：双击上一级“冰川重建”目录中的“启动冰川三维重建.lnk”，即可使用项目的虚拟环境打开 GUI，无需输入命令，也不会弹出终端。可右键该快捷方式，选择“发送到 → 桌面快捷方式”。如果移动项目文件夹，需要更新快捷方式的目标路径和起始位置。启动错误会显示提示，日志保存在 glacier_demo/logs 中。
+- Windows 10/11，Python 3.11 或更高版本。
+- 桌面程序依赖见 [`requirements.txt`](requirements.txt)。
+- 重建路径还需要独立安装相应的 VGGT、COLMAP 和/或 OpenMVS，以及可用的显卡驱动、CUDA 和模型权重（取决于所选方法）。这些工具不由本项目自动下载或安装。
 
-    cd glacier_demo
-    python -m venv .venv
-    .venv\\Scripts\\python.exe -m pip install -r requirements.txt
-    .venv\\Scripts\\python.exe main.py
+## 安装与启动
 
-程序启动后会在后台尝试查找 VGGT、COLMAP、OpenMVS 和 Python 环境。查找范围包括 PATH、VGGT_HOME / COLMAP_HOME / OPENMVS_HOME / CONDA_PREFIX 等环境变量、当前项目、常见用户安装目录及磁盘根目录下名称相关的安装目录；不会漫无边际地递归整个磁盘，也不会下载或安装工具。唯一候选会自动填入；多个版本可以在“选择检测结果 / 版本”中选择。
+在项目目录打开 PowerShell：
 
-如果工具装在非标准位置，点“扫描指定目录”并选择它的父文件夹。VGGT Python 候选会做隔离模式的短时核心模块检查，但不会导入模型、不分配显存，不能保证权重、CUDA 或所有运行依赖已配置。COLMAP/OpenMVS 的可执行文件被找到，只代表文件可用；正式任务启动前会验证路径，运行时还会实际检查返回状态。检测记录显示在窗口“工具检测结果”区域和任务日志中。
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe main.py
+```
 
-工具路径在检测/手动选定后会记入 glacier_demo/.local/tool_paths.json，启动时只恢复仍然有效的路径。保存配置仍可用于备份工具路径、附加参数和预处理设置；API 密钥不会写入配置文件。VGGT Python 指向能运行 VGGT 的解释器，仓库目录必须含 demo_colmap.py；COLMAP 选择 colmap.exe 或 PATH 中的 colmap；OpenMVS bin 目录应包含 InterfaceCOLMAP、DensifyPointCloud、ReconstructMesh、RefineMesh 和 TextureMesh。
+也可以运行 `python launch.py`。检查 Python 依赖是否可导入：
 
-程序会在 glacier_demo/.local/session.json 自动保存最近使用的照片列表、结果目录和模型路径。重启后会尝试恢复照片、模型预览及任务目录；原照片已移动或删除时，会使用任务目录中保留的预处理图像。API 密钥不会写入此恢复文件。
+```powershell
+.venv\Scripts\python.exe launch.py --check
+```
 
-清空照片列表后，下一次重建成功时会自动删除上一个任务目录以释放磁盘空间；新任务失败时会保留旧目录和模型。
+## 配置重建工具
 
-附加参数使用 JSON 数组或对象。程序保留并管理输入、输出和工作目录参数，避免附加参数把结果写到用户未选择的路径。
+启动后，程序会尝试查找 VGGT、COLMAP 和 OpenMVS。也可以在“重建路径与输出”区域手动选择程序或目录。检测到多个版本时，可从候选列表中选择。
 
-## 任务目录
+- VGGT Python：选择已安装 VGGT 依赖的 Python 解释器；VGGT 仓库目录应包含项目要求的入口脚本。
+- COLMAP：选择 `colmap.exe`，或确保 `colmap` 已加入 `PATH`。
+- OpenMVS：选择包含 `InterfaceCOLMAP`、`DensifyPointCloud`、`ReconstructMesh`、`RefineMesh` 和 `TextureMesh` 等程序的 `bin` 目录。
 
-每次任务创建 输出目录/run_时间_UUID/，包含预处理 images、A 和 B 的中间结果、manifest.json、task.log，以及可选的 A/evaluation.json 和 B/evaluation.json。原始图像只被读取。冰雪高光如果已经在相机中饱和，压缩只会压低剩余亮度范围，不能恢复真实纹理。
+自动检测只确认候选位置，不保证模型权重、显卡环境或全部运行依赖可用。程序开始任务时还会检查工具调用结果；详细信息见界面日志和任务目录中的 `task.log`。
 
-## 评价 API 约定
+## 基本使用
 
-DeepSeek 地址（如 `https://api.deepseek.com`）使用 DeepSeek Vision 的 Chat Completions 接口，自动发送模型斜视/侧视/俯视预览图、顶点/面数量和包围盒，并依据内置的竞赛原型展示100分评分表返回逐项证据、总分、问题与建议。所有进入评价的模型均计90分基础展示分，另按主体呈现、三维视觉质量和流程完成度给予最多10分加分；这属于竞赛展示鼓励分，不代表地理坐标或测绘精度已经验证。该模式要求填写 DeepSeek API Key，使用 `deepseek-flash`。模型图片和几何信息会发送到配置的 DeepSeek 服务。
+1. 导入同一场景的至少两张照片。
+2. 按需调整预处理参数；原始照片只读取，不会被覆盖。
+3. 选择一条或两条重建路径，设置输出目录并启动任务。
+4. 在模型页加载或查看结果，在任务日志页检查运行状态。
 
-其他自建评价地址仍使用 POST multipart/form-data：模型字段是 model.zip（包含 OBJ/PLY、同目录 MTL 和相对路径贴图），metadata 字段是 JSON 字符串。密钥通过配置鉴权头发送，默认 Authorization: Bearer <key>；密钥不会写入配置 JSON、manifest 或日志。响应应为 JSON 对象；界面直接展示后端返回内容。
+两条重建路径分别运行；其坐标原点、方向和尺度未必相同，因此并排展示不能直接作为几何配准或精度比较。冰雪高光若已在原始照片中饱和，后处理无法恢复已丢失的纹理信息。
 
-## 已验证
+## 结果与本机数据
 
-`python -m compileall -q glacier main.py`、`python launch.py --check`、DeepSeek 请求/评分逻辑模拟测试通过；VTK 已成功生成三张模型预览图。未使用真实 API Key 发起在线请求，首次真实评价仍需在界面填写 Key 并联调。
+每次任务在输出目录下创建独立的 `run_时间_UUID` 文件夹，通常包含预处理图像、中间结果、`manifest.json`、`task.log` 和可选的评价结果。具体内容取决于所选方法和运行是否成功。
+
+应用在项目的 `.local/` 中保存本机工具路径和恢复会话信息。这里可能包含 Windows 用户目录、照片位置和模型位置，因此不应上传或提交。清空照片列表后，程序会在后续重建成功时尝试清理旧任务目录；请在清理前确认其中没有需要保留的结果。
+
+## 可选：模型评价 API
+
+评价功能默认不启用。启用并配置服务后：
+
+- DeepSeek Vision 模式会发送模型的斜视、侧视和俯视预览图及几何摘要到所配置的 DeepSeek 服务。
+- 自建服务使用 multipart/form-data 上传模型归档和 metadata。
+- API 密钥仅在运行期间保存在界面内存中；应用不会将密钥写入项目配置或恢复会话文件。不要把密钥写进源码、README、日志、截图或公开问题报告。
+
+当前内置评价结果采用“90 分展示基础分 + 最多 10 分质量差异”的鼓励性计分方式。这是竞赛演示口径，不是独立精度验证，也不表示不同模型的质量差异只在 10 分以内。没有外部参考数据时，坐标和测绘精度仍属未验证。
+
+## GitHub 上传前检查
+
+仓库的 `.gitignore` 排除了虚拟环境、本机配置、日志、运行结果、密钥文件和常见模型权重。上传前仍应检查待提交文件和 Git 历史：忽略规则不会从既有提交中删除文件，也不会隐藏已经被 Git 跟踪的文件。
+
+```powershell
+git status --short
+git ls-files
+git check-ignore -v .venv .local logs outputs
+```
+
+`git ls-files` 中不应出现 `.local/`、`.venv/`、`logs/`、`outputs/`、API 密钥或私人照片。提交记录还包含 Git 作者姓名和邮箱；如不希望公开真实邮箱，请先在 GitHub 开启邮箱隐私，并将 Git 提交邮箱改为 GitHub 提供的 `noreply` 地址。把仓库设为私有可限制仓库访问者，但不能替代密钥管理。
+
+## 项目结构
+
+```text
+glacier_demo/
+├── assets/             # 应用使用的静态资源
+├── glacier/            # 界面、预处理、重建调度、模型查看与评价
+├── outputs/            # 本机任务结果（运行时生成，不纳入 Git）
+├── logs/               # 本机启动日志（运行时生成，不纳入 Git）
+├── main.py             # 桌面应用入口
+├── launch.py           # 启动与依赖检查入口
+├── requirements.txt    # 桌面版 Python 依赖
+└── README.md
+```
