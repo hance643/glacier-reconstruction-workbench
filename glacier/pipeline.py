@@ -7,6 +7,7 @@ import queue
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import psutil
 
@@ -178,21 +179,29 @@ def registered_count(folder):
 
 def run_vggt(images, output_dir, cfg, emit, stage, check_cancel):
     scene = output_dir / 'scene'
-    scene_images = scene / 'images'
-    scene_images.mkdir(parents=True)
-    for path in sorted(images.glob('*.png')):
-        check_cancel()
-        shutil.copy2(path, scene_images / path.name)
     repo = Path(cfg.vggt_repo).expanduser().resolve()
     stage(0, 1, 'VGGT 推理 / COLMAP 导出')
-    run_process([executable(cfg.vggt_python), repo / 'demo_colmap.py', '--scene_dir', scene,
-                 *argument_list(cfg.vggt_args)], repo, emit, check_cancel)
-    candidate = scene / 'sparse' / 'points.ply'
-    if not candidate.is_file():
-        candidates = sorted(scene.rglob('*.ply'))
-        if len(candidates) != 1:
-            raise RuntimeError('VGGT 已退出，但没有唯一可识别的 PLY 输出，请检查所安装版本及日志。')
-        candidate = candidates[0]
+    # pycolmap 3.13 on Windows cannot reliably create reconstruction files when
+    # its output path contains non-ASCII characters. Run it in the ASCII system
+    # temp directory, then copy its completed scene back to the user's run folder.
+    with tempfile.TemporaryDirectory(prefix='glacier_vggt_') as temporary:
+        temporary_scene = Path(temporary) / 'scene'
+        temporary_images = temporary_scene / 'images'
+        temporary_images.mkdir(parents=True)
+        for path in sorted(images.glob('*.png')):
+            check_cancel()
+            shutil.copy2(path, temporary_images / path.name)
+        run_process([executable(cfg.vggt_python), repo / 'demo_colmap.py', '--scene_dir', temporary_scene,
+                     *argument_list(cfg.vggt_args)], repo, emit, check_cancel)
+        candidate = temporary_scene / 'sparse' / 'points.ply'
+        if not candidate.is_file():
+            candidates = sorted(temporary_scene.rglob('*.ply'))
+            if len(candidates) != 1:
+                raise RuntimeError('VGGT 已退出，但没有唯一可识别的 PLY 输出，请检查所安装版本及日志。')
+            candidate = candidates[0]
+        candidate_relative = candidate.relative_to(temporary_scene)
+        shutil.copytree(temporary_scene, scene, dirs_exist_ok=True)
+    candidate = scene / candidate_relative
     model_dir = output_dir / 'model'
     model_dir.mkdir()
     model = model_dir / 'vggt_points.ply'

@@ -4,15 +4,15 @@ import json
 from pathlib import Path
 
 import math
-import random
-from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRectF, QObject, QEvent
-from PySide6.QtGui import (QBrush, QColor, QImage, QLinearGradient, QPainter, QPainterPath,
+from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QPoint, QRect, QRectF, QObject, QEvent
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QRegion,
                             QPen, QRadialGradient, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QInputDialog,
-    QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QSpinBox, QStyle, QStyleOptionGroupBox, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .evaluation import APIConfig, evaluate, validate_api
 from .pipeline import PipelineConfig
@@ -71,23 +71,17 @@ class DropList(QListWidget):
 
 
 class AtmosphereWidget(QWidget):
-    """Procedural animated dark atmosphere; no background image or network asset."""
+    """Procedural animated navy backdrop; no remote asset is required."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.phase = 0.0
         self._frame = QImage()
         self._frost = QImage()
         self._frame_size = None
+        # Bundled low-resolution snow landscape from the user-supplied visual
+        # reference. Keep a dark procedural fallback for moved/partial installs.
+        self.wallpaper = QImage(str(Path(__file__).resolve().parent.parent / 'assets' / 'snow-peaks-wallpaper.jpg'))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        # One-megapixel sparse film-grain layer, generated once and stretched to the window.
-        noise = QImage(1000, 1000, QImage.Format.Format_RGBA8888)
-        noise.fill(QColor(255, 255, 255, 0))
-        rng = random.Random(2048)
-        for _ in range(5000):  # 0.005 density, as requested
-            x, y = rng.randrange(1000), rng.randrange(1000)
-            shade = rng.choice((196, 206, 222, 235))
-            noise.setPixelColor(x, y, QColor(shade, shade, shade, 10))
-        self.grain = noise
         self.clock = QTimer(self)
         self.clock.setInterval(100)
         self.clock.timeout.connect(self.advance)
@@ -113,7 +107,7 @@ class AtmosphereWidget(QWidget):
         from PIL import Image, ImageFilter
         frame = QImage(max(1, size[0] // 2), max(1, size[1] // 2),
                        QImage.Format.Format_RGBA8888)
-        frame.fill(QColor('#080a12'))
+        frame.fill(QColor('#05080e'))
         painter = QPainter(frame)
         self.draw_scene(painter, frame.width(), frame.height())
         painter.end()
@@ -132,30 +126,50 @@ class AtmosphereWidget(QWidget):
         painter.drawImage(self.rect(), self._frame)
 
     def draw_scene(self, painter, width, height):
-        """Procedural scene shared by the clear and frosted layers."""
+        """Draw the reference wallpaper and subdued navy veil."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         bounds = QRectF(0, 0, width, height)
-        painter.fillRect(bounds, QColor('#080a12'))
-        base = QLinearGradient(0, 0, width, height)
-        base.setColorAt(0.0, QColor('#0C1724'))
-        base.setColorAt(0.46, QColor('#0E1C2B'))
-        base.setColorAt(1.0, QColor('#09121D'))
-        painter.fillRect(bounds, base)
+        painter.fillRect(bounds, QColor('#05080e'))
+        if not self.wallpaper.isNull():
+            # Cover the available area without stretching the landscape.
+            source = QRectF(self.wallpaper.rect())
+            source_aspect = source.width() / max(1, source.height())
+            target_aspect = width / max(1, height)
+            if source_aspect > target_aspect:
+                crop_width = source.height() * target_aspect
+                source.setX((source.width() - crop_width) / 2)
+                source.setWidth(crop_width)
+            else:
+                crop_height = source.width() / target_aspect
+                source.setY((source.height() - crop_height) / 2)
+                source.setHeight(crop_height)
+            painter.drawImage(bounds, self.wallpaper, source)
+        else:
+            base = QLinearGradient(0, 0, width, height)
+            base.setColorAt(0.0, QColor('#101B2A'))
+            base.setColorAt(0.46, QColor('#0B1725'))
+            base.setColorAt(1.0, QColor('#060B13'))
+            painter.fillRect(bounds, base)
+
+        # The reference keeps photography visible while a navy veil protects
+        # foreground contrast; darken edges and the header without flattening it.
+        painter.fillRect(bounds, QColor(4, 7, 13, 72))
+        top_veil = QLinearGradient(0, 0, 0, height * .24)
+        top_veil.setColorAt(0, QColor(4, 7, 13, 150))
+        top_veil.setColorAt(1, QColor(4, 7, 13, 0))
+        painter.fillRect(bounds, top_veil)
 
         # 多个大而虚的灰蓝色雾团彼此叠加，形成参考截图中的云雾纹理；
         # 透明度保持克制，不形成亮斑。频率为整数，动画循环无跳变。
         t = self.phase
         clouds = [
-            (.08, .14, .19, .25, 48, 0.0),
-            (.29, .26, .21, .18, 42, 1.2),
-            (.52, .12, .18, .23, 48, 2.4),
-            (.79, .22, .22, .26, 50, 3.1),
-            (.99, .48, .18, .27, 44, 4.2),
-            (.66, .61, .23, .21, 45, 5.1),
-            (.32, .78, .22, .2, 43, .7),
-            (.08, .91, .2, .22, 39, 2.8),
-            (.91, .86, .16, .18, 40, 4.8),
-            (.46, .45, .13, .19, 31, 3.7),
+            (.12, .18, .19, .25, 5, 0.0),
+            (.34, .34, .21, .18, 4, 1.2),
+            (.72, .18, .18, .23, 5, 2.4),
+            (.91, .48, .22, .26, 5, 3.1),
+            (.63, .76, .23, .21, 4, 5.1),
+            (.13, .84, .2, .22, 4, 2.8),
         ]
         for index, (x, y, rx, ry, alpha, offset) in enumerate(clouds):
             drift_x = .018 * math.sin(t + offset)
@@ -176,50 +190,19 @@ class AtmosphereWidget(QWidget):
             painter.drawEllipse(QPointF(0, 0), 1.0, 1.0)
             painter.restore()
 
-        # 一处很弱的冰川折射微光，保留截图里右上区域的冷色反射感。
-        painter.save()
-        painter.translate(width * (.78 + .012 * math.sin(t)),
-                          height * (.23 + .014 * math.cos(t)))
-        painter.rotate(-24)
-        painter.scale(width * .12, height * .035)
-        shimmer = QRadialGradient(QPointF(0, 0), 1.0)
-        shimmer.setColorAt(0, QColor(157, 188, 216, 8))
-        shimmer.setColorAt(.35, QColor(111, 145, 177, 4))
-        shimmer.setColorAt(1, QColor(95, 121, 144, 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(shimmer)
-        painter.drawEllipse(QPointF(0, 0), 1.0, 1.0)
-        painter.restore()
-
-        vignette = QRadialGradient(QPointF(width * .5, height * .48),
+        # Match the reference's dark veil: the center remains legible while
+        # the outer edge and top are gently shaded behind the glass panels.
+        vignette = QRadialGradient(QPointF(width * .5, height * .46),
                                    max(width, height) * .78)
-        vignette.setColorAt(0, QColor(0, 0, 0, 0))
-        vignette.setColorAt(.58, QColor(0, 0, 0, 3))
-        vignette.setColorAt(1, QColor(0, 0, 0, 16))
+        vignette.setColorAt(0, QColor(4, 7, 13, 0))
+        vignette.setColorAt(.30, QColor(4, 7, 13, 0))
+        vignette.setColorAt(.72, QColor(4, 7, 13, 78))
+        vignette.setColorAt(1, QColor(4, 7, 13, 170))
         painter.fillRect(bounds, vignette)
-        painter.setOpacity(.10)
-        painter.drawImage(bounds, self.grain)
-
-        # Soft ice-face reflections replace the illustrative mountain line.
-        painter.setOpacity(1)
-        for x, y, angle, strength in ((.31, .52, 24, 12), (.59, .67, 32, 16),
-                                       (.85, .46, 18, 11)):
-            painter.save()
-            painter.translate(width*x, height*y)
-            painter.rotate(angle)
-            painter.scale(width*.035, height*.32)
-            reflection = QRadialGradient(QPointF(0, 0), 1)
-            reflection.setColorAt(0, QColor(168, 201, 227, strength))
-            reflection.setColorAt(.4, QColor(106, 151, 186, strength//2))
-            reflection.setColorAt(1, QColor(106, 151, 186, 0))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(reflection)
-            painter.drawEllipse(QPointF(0, 0), 1, 1)
-            painter.restore()
 
 
-def paint_frost(widget, painter, rect):
-    """Backdrop blur + CSS rgba(25,35,50,.22) + fine white rim."""
+def paint_frost(widget, painter, rect, radius=18, top_gap=None):
+    """Paint a translucent frosted panel and a clean hairline rim."""
     root = widget.window().centralWidget()
     if not isinstance(root, AtmosphereWidget):
         return
@@ -227,33 +210,67 @@ def paint_frost(widget, painter, rect):
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     path = QPainterPath()
-    path.addRoundedRect(rect, 10, 10)
+    path.addRoundedRect(rect, radius, radius)
     painter.setClipPath(path)
     position = widget.mapTo(root, QPoint(0, 0))
     sx = root._frost.width() / max(1, root.width())
     sy = root._frost.height() / max(1, root.height())
-    source = QRectF((position.x()+rect.x())*sx, (position.y()+rect.y())*sy,
-                    rect.width()*sx, rect.height()*sy)
+    source = QRectF((position.x() + rect.x()) * sx,
+                    (position.y() + rect.y()) * sy,
+                    rect.width() * sx, rect.height() * sy)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
     painter.drawImage(rect, root._frost, source)
+    # A light navy tint preserves legibility while allowing the glacier
+    # wallpaper to remain visible through the glass, as in the reference.
     painter.fillRect(rect, QColor(25, 35, 50, 46))
     sheen = QLinearGradient(rect.topLeft(), rect.bottomRight())
-    sheen.setColorAt(0, QColor(208, 231, 249, 13))
+    sheen.setColorAt(0, QColor(208, 231, 249, 8))
     sheen.setColorAt(.35, QColor(208, 231, 249, 0))
-    sheen.setColorAt(1, QColor(188, 219, 244, 5))
+    sheen.setColorAt(1, QColor(188, 219, 244, 4))
     painter.fillRect(rect, sheen)
     painter.setClipping(False)
     painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.setPen(QPen(QColor(239, 248, 255, 64), 1))
-    painter.drawRoundedRect(rect.adjusted(.5, .5, -.5, -.5), 10, 10)
-    inner = rect.adjusted(1.5, 1.5, -1.5, -1.5)
-    edge = QLinearGradient(inner.topLeft(), inner.bottomLeft())
-    edge.setColorAt(0, QColor(224, 242, 255, 38))
-    edge.setColorAt(.12, QColor(224, 242, 255, 0))
-    edge.setColorAt(.86, QColor(224, 242, 255, 0))
-    edge.setColorAt(1, QColor(174, 211, 239, 23))
-    painter.setPen(QPen(QBrush(edge), 1))
-    painter.drawRoundedRect(inner, 9, 9)
+    # Leave the title's span clear so the frame line does not run through it.
+    if top_gap:
+        gap_region = QRegion(widget.rect()).subtracted(
+            QRegion(QRect(top_gap[0], round(rect.top() - 3), top_gap[1], 7)))
+        painter.save()
+        painter.setClipRegion(gap_region)
+    painter.setPen(QPen(QColor(255, 255, 255, 33), 1))
+    painter.drawRoundedRect(rect.adjusted(.5, .5, -.5, -.5), radius, radius)
+    if top_gap:
+        painter.restore()
+    painter.restore()
+
+
+def paint_title_slot(widget, painter, rect):
+    """Give a group-box heading the light, recessed glass-pill treatment."""
+    root = widget.window().centralWidget()
+    if not isinstance(root, AtmosphereWidget):
+        return
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+    painter.setClipPath(path)
+
+    painter.fillRect(rect, QColor(17, 24, 38, 255))
+
+    # Keep a subtle gloss while the solid base blocks background details.
+    gloss = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+    gloss.setColorAt(0, QColor(242, 249, 255, 52))
+    gloss.setColorAt(.48, QColor(212, 232, 249, 16))
+    gloss.setColorAt(1, QColor(143, 178, 210, 12))
+    painter.fillRect(rect, gloss)
+
+    painter.setClipping(False)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor(235, 246, 255, 88), 1))
+    painter.drawRoundedRect(rect.adjusted(.5, .5, -.5, -.5),
+                            rect.height() / 2, rect.height() / 2)
+    painter.setPen(QPen(QColor(255, 255, 255, 48), 1))
+    painter.drawLine(QPointF(rect.left() + 16, rect.top() + 2),
+                     QPointF(rect.right() - 16, rect.top() + 2))
     painter.restore()
 
 
@@ -264,7 +281,40 @@ class FrostGroupBox(QGroupBox):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        paint_frost(self, painter, QRectF(self.rect()).adjusted(0, 12, 0, 0))
+        # Use Qt's actual title geometry, then size the heading with the same
+        # installed bold Chinese font used by the stylesheet.
+        option = QStyleOptionGroupBox()
+        self.initStyleOption(option)
+        title_font = QFont('Noto Sans SC')
+        title_font.setPixelSize(18)
+        title_font.setWeight(QFont.Weight.Black)
+        option.font = title_font
+        option.text = self.title()
+        title_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_GroupBox, option,
+            QStyle.SubControl.SC_GroupBoxLabel, self)
+        # Measure the same string with the same font; use this exact extent for
+        # both the frame notch and blue marker placement.
+        text_width = QFontMetrics(title_font).horizontalAdvance(self.title())
+        # Reserve a fixed slot for the accent so QSS padding and the platform
+        # style geometry cannot shift the marker into the visible title.
+        text_left = 32
+        marker_width = 6
+        marker_gap = 6
+        marker_x = text_left - marker_gap - marker_width
+        gap_start = max(8, marker_x - 5)
+        gap_end = text_left + text_width + 8
+        paint_frost(self, painter, QRectF(self.rect()).adjusted(0, 12, 0, 0),
+                    top_gap=(gap_start, gap_end - gap_start))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#168FEA'))
+        # Put the blue accent immediately to the left of the heading and
+        # align its vertical center with the heading's actual label center.
+        marker_y = title_rect.center().y() - 6
+        painter.drawRoundedRect(QRectF(marker_x, marker_y, marker_width, 18), 1.5, 1.5)
+        painter.restore()
         painter.end()
         super().paintEvent(event)
 
@@ -276,7 +326,7 @@ class FrostLabel(QLabel):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        paint_frost(self, painter, QRectF(self.rect()))
+        paint_frost(self, painter, QRectF(self.rect()), radius=14)
         painter.end()
         super().paintEvent(event)
 
@@ -344,10 +394,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('冰川三维重建 · Glacier Reconstruction Studio')
-        # Start in the same landscape, compact workstation proportion as the
-        # supplied reference while remaining resizable on smaller displays.
-        self.resize(1440, 810)
-        self.setMinimumSize(1180, 700)
+        # Open at a more compact size while allowing the user to shrink the
+        # workstation substantially on smaller screens.
+        self.resize(1100, 700)
+        self.setMinimumSize(820, 560)
         self.setAcceptDrops(True)
         self.workers = set()       # 保持强引用，防止运行中的 QThread 被析构
         self.job = None
@@ -374,7 +424,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(22, 16, 22, 12)
         layout.setSpacing(8)
-        brand = QLabel('GLACIER  /  FIELD RECONSTRUCTION')
+        brand = QLabel("Let's START")
         brand.setObjectName('eyebrow')
         layout.addWidget(brand)
         self.title_label = QLabel('冰川三维重建工作台')
@@ -396,7 +446,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         # Keep the control rail compact and prevent a horizontal scrollbar from
         # appearing when long filesystem paths are present in the editors.
-        scroll.setMinimumWidth(340)
+        scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(380)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -412,7 +462,7 @@ class MainWindow(QMainWindow):
         side.addStretch()
         self.tabs = FrostTabs()
         splitter.addWidget(self.tabs)
-        splitter.setSizes([390, 1210])
+        splitter.setSizes([340, 760])
         self._input_page()
         self._results_page()
         self._logs_page()
@@ -482,9 +532,11 @@ class MainWindow(QMainWindow):
 
     def _path_field(self, form, label, mode, initial=''):
         field = QLineEdit(initial)
+        field.setObjectName('pathField')
+        field.setMinimumWidth(0)
         button = QPushButton('浏览')
         button.setObjectName('browseButton')
-        button.setFixedWidth(52)
+        button.setFixedWidth(44)
         button.setFixedHeight(30)
         button.setToolTip('选择文件或文件夹')
         def choose():
@@ -497,7 +549,7 @@ class MainWindow(QMainWindow):
         button.clicked.connect(choose)
         row = QHBoxLayout()
         row.setSpacing(4)
-        row.addWidget(field)
+        row.addWidget(field, 1)
         row.addWidget(button)
         form.addRow(label, row)
         return field
@@ -557,7 +609,9 @@ class MainWindow(QMainWindow):
         self.discovery_label = QLabel('启动后自动查找已安装工具')
         self.discovery_label.setWordWrap(True)
         self.discovery_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.discovery_label.setMaximumHeight(62)
+        # The scroll rail must grow to the complete wrapped message. QLabel's
+        # height-for-width hint is not always honored inside QFormLayout, so we
+        # explicitly size it after layout and whenever the window is resized.
         form.addRow(self.discovery_label)
         layout.addWidget(box)
 
@@ -629,6 +683,7 @@ class MainWindow(QMainWindow):
 
     def _preview_label(self, name):
         label = FrostLabel(name)
+        label.setObjectName('previewLabel')
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setMinimumSize(160, 140)
         label.setStyleSheet('background:transparent;border:0;color:#D5E4F1;')
@@ -820,7 +875,7 @@ class MainWindow(QMainWindow):
             if is_tool_path(key, current[key]):
                 current[key] = str(Path(current[key]).expanduser().resolve())
         self.detect_button.setEnabled(False)
-        self.discovery_label.setText('正在后台查找安装位置并检查 Python 依赖…')
+        self._set_discovery_text('正在后台查找安装位置并检查 Python 依赖…')
         self.stage_label.setText('搜索本机已安装工具…')
         def scan(report, check):
             return discover(Path(__file__).resolve().parents[1], current, report, check)
@@ -859,7 +914,7 @@ class MainWindow(QMainWindow):
         if unusable:
             notes.append(f'另有 {len(unusable)} 个 Python 候选缺少依赖或不可启动，完整详情见日志。')
         self.stage_label.setText('工具检测完成')
-        self.discovery_label.setText(' · '.join(summary + notes) or '未发现工具，请使用“扫描指定目录”。')
+        self._set_discovery_text(' · '.join(summary + notes) or '未发现工具，请使用“扫描指定目录”。')
         self.log.appendPlainText('工具检测完成：' + (self.discovery_label.text()))
         for name, path in configured.items():
             self.log.appendPlainText(f'{name}：{path}')
@@ -873,8 +928,24 @@ class MainWindow(QMainWindow):
     def detection_failed(self, message):
         self.detect_button.setEnabled(True)
         self.stage_label.setText('工具检测失败')
-        self.discovery_label.setText('检测未完成：' + message)
+        self._set_discovery_text('检测未完成：' + message)
         self.log.appendPlainText('自动检测失败：' + message)
+
+    def _set_discovery_text(self, text):
+        """Set tool-detection status and make the left scroll rail fit all lines."""
+        self.discovery_label.setText(text)
+        QTimer.singleShot(0, self._fit_discovery_label)
+
+    def _fit_discovery_label(self):
+        """Force the wrapped status label to its full height for its current width."""
+        label = getattr(self, 'discovery_label', None)
+        if label is None or label.width() < 2:
+            return
+        label.setMinimumHeight(0)
+        measured = label.heightForWidth(label.contentsRect().width())
+        if measured > 0:
+            label.setMinimumHeight(measured + 4)
+            label.updateGeometry()
 
     def choose_scan_roots(self):
         """用户明确选择目录后才扩大搜索范围。"""
@@ -1114,6 +1185,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, 'discovery_label'):
+            QTimer.singleShot(0, self._fit_discovery_label)
         if hasattr(self, 'title_label'):
             self.title_label.setStyleSheet(
                 'font-size:28px;font-weight:700;color:#FFFFFF;' if self.width() < 1180
@@ -1121,44 +1194,47 @@ class MainWindow(QMainWindow):
 
 
 STYLE = """
-QWidget { font-family:'Montserrat','Microsoft YaHei UI','Segoe UI'; font-size:13px; color:#F2F1EE; background:transparent; }
-QMainWindow { background:#08090C; }
+QWidget { font-family:'Segoe UI','PingFang SC','Microsoft YaHei UI','Microsoft YaHei',sans-serif; font-size:14px; color:#F1F6FC; background:transparent; }
+QMainWindow { background:#05080E; }
 QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }
 QSplitter::handle { background:transparent; }
-QGroupBox { font-size:16px; font-weight:500; border:0; border-radius:10px; margin-top:12px; padding:8px 2px 8px; background:transparent; }
-QGroupBox::title { subcontrol-origin:margin; left:18px; padding:0 8px; color:#CEC8BB; }
-QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(211,230,247,20),stop:0.12 rgba(132,164,192,13),stop:1 rgba(174,201,224,10)); border:1px solid rgba(214,232,248,43); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#4D6BFE; alternate-background-color:rgba(255,255,255,8); }
-QListWidget#glassDropList { background:transparent; border:0; }
+QGroupBox { font-size:18px; font-weight:900; border:0; border-radius:10px; margin-top:12px; padding:8px 2px 8px; background:transparent; }
+QGroupBox::title { subcontrol-origin:margin; left:32px; padding:0; color:#CEC8BB; font-family:'Noto Sans SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:18px; font-weight:900; }
+QLineEdit, QPlainTextEdit, QListWidget, QSpinBox, QDoubleSpinBox, QTableWidget, QComboBox { background:rgb(13,20,32); border:1px solid rgb(72,86,104); border-radius:10px; padding:3px 7px; color:#FFFFFF; selection-background-color:#4D6BFE; alternate-background-color:rgb(21,30,44); }
+QLineEdit#pathField { font-size:11px; padding-left:5px; padding-right:5px; }
+QListWidget#glassDropList { background:rgb(13,20,32); border:1px solid rgb(72,86,104); }
 QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border:1px solid #4D6BFE; }
 QListWidget::item { padding:7px 8px; border-radius:8px; }
-QListWidget::item:selected, QTableWidget::item:selected { background:rgba(77,107,254,65); color:#FFFFFF; }
-QHeaderView::section { background:rgba(255,255,255,10); color:#CEC8BB; border:0; padding:8px; }
-QPushButton { min-height:20px; background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(241,247,252,235),stop:1 rgba(207,221,234,225)); color:#17202A; border:1px solid rgba(245,250,255,215); border-radius:100px; padding:4px 12px; font-size:12px; }
-QPushButton#browseButton { min-height:24px; padding:2px 4px; font-size:12px; border-radius:100px; }
-QPushButton:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #FFFFFF,stop:1 #E3EDF5); border-color:#E8F2FA; }
-QPushButton:pressed { background:#BEB7A8; }
-QPushButton:disabled { color:rgba(26,22,21,105); background:rgba(255,255,255,105); border-color:rgba(255,255,255,80); }
-QPushButton#primaryButton { background:#FFFFFF; color:#1A1615; border:1px solid #FFFFFF; font-weight:700; padding:8px 24px; }
-QPushButton#primaryButton:hover { background:#CEC8BB; border-color:#CEC8BB; }
+QListWidget::item:selected, QTableWidget::item:selected { background:rgb(45,67,112); color:#FFFFFF; }
+QHeaderView::section { background:rgb(24,33,48); color:#CEC8BB; border:0; padding:8px; }
+QPushButton { min-height:20px; background:rgb(17,24,38); color:#F1F6FC; border:1px solid rgb(94,108,126); border-radius:100px; padding:4px 12px; font-size:12px; }
+QPushButton#browseButton { min-height:24px; padding:2px 4px; font-size:12px; border-radius:100px; background:rgb(17,24,38); border:1px solid rgb(94,108,126); }
+QPushButton#browseButton:hover { background:rgb(30,42,60); border-color:rgb(150,168,188); }
+QPushButton:hover { background:rgb(30,42,60); border-color:rgb(150,168,188); }
+QPushButton:pressed { background:rgb(38,48,63); }
+QPushButton:disabled { color:rgb(128,140,154); background:rgb(15,21,31); border-color:rgb(54,64,78); }
+QPushButton#primaryButton { background:rgb(24,32,48); color:#FFFFFF; border:1px solid rgb(126,144,164); font-weight:600; padding:8px 24px; }
+QPushButton#primaryButton:hover { background:rgb(40,52,73); border-color:rgb(180,194,208); }
 QTabWidget::pane { border:0; background:transparent; top:-1px; }
 QTabWidget#glassTabs::pane { border:0; background:transparent; }
 QScrollArea#glassRail { border:0; background:transparent; }
-QTabBar::tab { color:rgba(220,234,248,190); background:transparent; border:1px solid transparent; border-radius:100px; padding:6px 12px; margin:3px; font-size:12px; }
-QTabBar::tab:selected { color:#FFFFFF; background:rgba(77,107,254,42); border-color:rgba(77,107,254,115); }
-QProgressBar { border:1px solid rgba(255,255,255,48); border-radius:100px; text-align:center; min-height:16px; background:rgba(255,255,255,12); color:#FFFFFF; }
+QTabBar::tab { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:16px; font-weight:800; color:rgba(220,234,248,190); background:rgb(13,20,32); border:1px solid rgb(48,59,75); border-radius:100px; padding:6px 12px; margin:3px; }
+QTabBar::tab:selected { color:#FFFFFF; background:rgb(37,53,91); border-color:rgb(77,107,254); }
+QProgressBar { border:1px solid rgb(94,108,126); border-radius:100px; text-align:center; min-height:16px; background:rgb(13,20,32); color:#FFFFFF; }
 QProgressBar::chunk { background:#AEC7D9; border-radius:100px; }
 QCheckBox { spacing:10px; }
-QCheckBox::indicator { width:18px; height:18px; border-radius:5px; border:1px solid rgba(255,255,255,100); background:rgba(255,255,255,12); }
+QCheckBox::indicator { width:18px; height:18px; border-radius:5px; border:1px solid rgb(120,136,154); background:rgb(13,20,32); }
 QCheckBox::indicator:checked { background:#4D6BFE; border-color:#4D6BFE; }
 QScrollBar:vertical { background:transparent; width:10px; margin:4px; }
 QScrollBar::handle:vertical { background:rgba(255,255,255,60); border-radius:5px; min-height:28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
-QStatusBar { font-size:11px; color:#95A6B8; background:transparent; }
+QStatusBar { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-size:11px; font-weight:700; color:#95A6B8; background:transparent; }
 QToolTip { color:#FFFFFF; background:#151923; border:1px solid rgba(255,255,255,65); border-radius:8px; padding:6px; }
 QLabel#appTitle { font-size:28px; font-weight:700; color:#FFFFFF; }
 QLabel#subtitle { color:rgba(220,234,248,175); font-size:12px; }
-QLabel#eyebrow { color:#D2DFEB; font-size:16px; font-weight:500; letter-spacing:2px; }
-QLabel#statusText { color:#C7D8E8; font-size:11px; }
+QLabel#eyebrow { color:#D2DFEB; font-size:20px; font-weight:700; letter-spacing:2px; }
+QLabel#statusText { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; color:#C7D8E8; font-size:11px; font-weight:700; }
+QLabel#previewLabel { font-family:'Source Han Sans CN','思源黑体','Noto Sans CJK SC','Microsoft YaHei UI','Microsoft YaHei','Segoe UI',sans-serif; font-weight:700; }
 QLabel#sectionTitle { font-size:16px; font-weight:600; color:#FFFFFF; }
 QLabel#hint { color:rgba(215,230,245,155); font-size:11px; }
 """
